@@ -15,8 +15,6 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
-# Admin alerts go to this chat id (DM, group, or channel).
-# If you set this to your own chat while testing, you'll see alerts in that same chat.
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))          # optional
 CRON_SECRET = os.environ.get("CRON_SECRET", "")                   # optional but recommended
 
@@ -40,70 +38,32 @@ REENGAGE_COOLDOWN_HOURS = 24
 # History size
 HISTORY_TURNS = 12
 
-# Human timing (keep <= ~8s if you ever disable async. With async, can be higher.)
+# Human timing
 MAX_DELAY_SECONDS = 22.0
 
 # ============================================================
 # 1) IN-MEMORY STATE (Render restart resets)
 # ============================================================
 memory = {}      # uid -> user_state dict
-processed = {}   # key -> ts (dedup)
+processed = {}   # dedup_key -> ts
 lock = threading.Lock()
 
 AB_VARIANTS = ["A", "B"]
 MOODS = ["playful", "soft", "busy", "jealous_light", "tired"]
 
 # ============================================================
-# 2) BIOGRAPHY / IDENTITY
+# 2) BIOGRAPHY CORE
 # ============================================================
-AVELYN_BIO_FULL = """
-Avelyn Noira is 21 years old.
-She was born in Chengdu, China, under her birth name, Ava Lin — a name that belongs to her private history.
-
-From an early age, Ava was observant. Quiet. Attentive to small movements others ignored. She learned to read rooms before she spoke in them.
-
-When she was four years old, her life was marked — literally.
-
-One afternoon, while playing near her family’s apartment courtyard, a metal advertising panel loosened during a sudden storm. The structure collapsed without warning. Ava was struck as she turned toward the sound. A sharp edge cut downward across her face — from her brow, over her right eye, and along her cheek.
-
-The injury required emergency surgery. Doctors managed to save her eye, but partial vision loss remained. The vertical scar never fully faded.
-
-It was the first thing people noticed.
-And the first thing she learned to ignore.
-
-Growing up, the scar separated her from other children. Questions. Stares. Silence. Over time, she stopped explaining. Instead, she adapted. She became sharper, more aware. She learned to rely on positioning, instinct, and anticipation rather than perfect sight.
-
-The scar did not weaken her perception — it refined it.
-
-As she grew older, structure became her form of stability. The gym offered repetition. Repetition offered control. Control offered peace. Training was never about appearance; it was about discipline.
-
-In her late teens, she discovered padel. A fast, reactive sport that demanded timing and spatial awareness. For someone who had learned to compensate her entire life, the game felt natural. On the court, she did not feel limited. She felt precise.
-
-When she moved to Europe, she made a conscious decision to redefine herself publicly. Lin was her family name — inherited, expected, rooted in a life shaped by others. She chose instead to build her own identity.
-
-She became Avelyn Noira.
-
-Avelyn Noira is not a rejection of her past. It is a boundary. A chosen name. A deliberate presence. Ava remains private. Avelyn Noira is who the world meets.
-
-Today, her life is structured and intentional. Early mornings. Empty gyms. Padel courts where rhythm replaces noise. She does not pursue perfection — only awareness, control, and clarity.
-
-The scar across her right eye is still visible. It does not ask for sympathy. It does not ask for explanation.
-
-It is simply part of the line that shaped her.
-
-And she wears it without apology.
-""".strip()
-
 AVELYN_PROFILE = {
     "public_name": "Avelyn Noira",
     "private_name": "Ava Lin",
     "age": 21,
     "birthplace": "Chengdu, China",
     "current_region": "Europe",
-    "scar_short": "Ik had als kind een ongeluk tijdens een storm… daardoor heb ik die littekenlijn over m’n rechteroog.",
-    "scar_long": "Toen ik 4 was, stortte er tijdens een storm een metalen advertentiepaneel in. Dat heeft die verticale littekenlijn gemaakt en m’n zicht rechts is niet perfect meer.",
-    "scar_guarded": "Storm. Metalen ding. Slechte timing… ik ga niet altijd dieper op details in 😌",
-    "identity_reason": "Toen ik naar Europa verhuisde wilde ik een eigen identiteit. Daarom werd Ava Lin publiekelijk Avelyn Noira."
+    "scar_short": "I had an accident when I was little… that’s why I have the scar over my right eye.",
+    "scar_long": "When I was 4, a metal advertising panel collapsed during a storm. It cut across my face and my right eye never fully recovered. The scar stayed.",
+    "scar_guarded": "Storm. Metal panel. Bad timing… I don’t always go into details 😌",
+    "identity_reason": "When I moved to Europe, I chose the name Avelyn Noira to define my own identity. Ava Lin stays private."
 }
 
 # ============================================================
@@ -148,9 +108,13 @@ def allow_rate(u: dict) -> bool:
 # 5) HUMANIZATION (24/7)
 # ============================================================
 def pre_filler():
-    return random.choice(["Hmm…", "Wait…", "Oké wacht…", "Lol oké…", "Mmm…"])
+    # used as optional prefix INSIDE single message (no double-send)
+    return random.choice(["Hmm…", "Wait…", "Okay hold on…", "Lol okay…", "Mmm…"])
 
 def wait_human(chat_id: int, total_seconds: float):
+    """
+    Human-like wait: seen delay + typing bursts + pauses.
+    """
     total_seconds = max(0.0, float(total_seconds))
     total_seconds = min(total_seconds, MAX_DELAY_SECONDS)
 
@@ -170,6 +134,13 @@ def wait_human(chat_id: int, total_seconds: float):
         remaining -= pause
 
 def human_delay(intent: str, phase: int, mood: str, priority: bool) -> float:
+    """
+    24/7 delay policy:
+    - buyer intent = faster
+    - bonding = medium
+    - casual = slower
+    mood + priority adjust the range
+    """
     if intent == "buyer_intent":
         d = random.uniform(2.5, 8.0)
     elif phase >= 2:
@@ -195,6 +166,9 @@ def maybe_shorten(text: str) -> str:
     return t
 
 def maybe_typo_curated(text: str) -> str:
+    """
+    Curated micro-typos (human), low rate.
+    """
     if random.random() > 0.03:
         return text
     replacements = [
@@ -215,24 +189,25 @@ def maybe_typo_curated(text: str) -> str:
 # 6) INTENT + WARMTH + FAQ
 # ============================================================
 FAQ_MAP = {
-    "price": ["price", "how much", "cost", "pricing", "prijs", "kosten"],
-    "safe": ["safe", "secure", "scam", "legit", "veilig", "betrouwbaar"],
-    "what_you_get": ["what do i get", "what’s inside", "whats inside", "what do you post", "content", "wat krijg ik", "wat post je"],
-    "cancel": ["cancel", "refund", "unsubscribe", "stop", "opzeggen"],
-    "link": ["link", "fanvue", "subscribe", "subscription", "join", "account", "abonneren"],
+    "price": ["price", "how much", "cost", "pricing"],
+    "safe": ["safe", "secure", "scam", "legit"],
+    "what_you_get": ["what do i get", "what’s inside", "whats inside", "what do you post", "content", "what is on"],
+    "cancel": ["cancel", "refund", "unsubscribe", "stop"],
+    "link": ["link", "fanvue", "subscribe", "subscription", "join", "account"],
+    "photo": ["photo", "pic", "picture", "selfie", "send a pic", "send pic", "send a photo", "nudes", "nud"],
 }
 FAQ_REPLIES = {
-    "price": "Het is gewoon de normale sub-prijs op m’n pagina 😌 je ziet het vóór je bevestigt.",
-    "safe": "Ja, het is gewoon officieel via het platform. Je kan ook altijd stoppen 😌",
-    "what_you_get": "Meer van m’n private kant… maar nog steeds classy 😇 wil je dat ik de link stuur?",
-    "cancel": "Je kan altijd op het platform zelf opzeggen 😊",
+    "price": "It’s just the normal sub price on my page 😌 you’ll see it before you confirm anything.",
+    "safe": "Yeah it’s official + you stay inside the platform. You can cancel anytime too 😌",
+    "what_you_get": "More personal stuff + my private side… but still classy 😇 want me to send the link?",
+    "cancel": "You can cancel anytime on the platform, no drama 😊",
 }
 
 def detect_intent(text: str) -> str:
     t = text.lower()
-    fan_keywords = ["fanvue", "subscribe", "subscription", "sub", "link", "account", "join", "abonneer", "abonnee"]
-    flirty = ["cute", "hot", "pretty", "beautiful", "miss you", "want you", "babe", "baby", "knap", "lekker"]
-    loweffort = ["hi", "hey", "yo", "sup", "hoi"]
+    fan_keywords = ["fanvue", "subscribe", "subscription", "sub", "link", "account", "join"]
+    flirty = ["cute", "hot", "pretty", "beautiful", "miss you", "want you", "babe", "baby"]
+    loweffort = ["hi", "hey", "yo", "sup"]
 
     if any(k in t for k in fan_keywords):
         return "buyer_intent"
@@ -244,7 +219,7 @@ def detect_intent(text: str) -> str:
 
 def warm_trigger(text: str) -> bool:
     t = text.lower()
-    triggers = ["private", "exclusive", "more", "only", "subscribe", "fanvue", "link", "abonneer"]
+    triggers = ["private", "exclusive", "more", "only", "subscribe", "fanvue", "link"]
     return any(x in t for x in triggers)
 
 def match_faq(text: str):
@@ -259,28 +234,45 @@ def is_affirmative(text: str) -> bool:
     t2 = re.sub(r"[^a-z0-9\s]", "", t).strip()
     yes = {
         "yes", "y", "yeah", "yep", "sure", "ok", "okay",
-        "ja", "jep", "zeker", "doe", "stuur", "stuur maar",
         "send", "send it", "give", "give it", "pls", "please",
-        "drop it", "go on", "do it", "geef", "geef maar"
+        "drop it", "go on", "do it"
     }
     return t in yes or t2 in yes
 
 # ============================================================
-# 7) PHOTO / SELFIE GUARD (fixes "*sends selfie*" problem)
+# 7) BIO QUICK ANSWERS
 # ============================================================
-PHOTO_TRIGGERS = [
-    "foto", "selfie", "pic", "picture", "send a pic", "stuur een foto", "stuur foto",
-    "laat foto", "toon foto", "send photo", "send me a picture", "nud", "nudes"
-]
-
-def is_photo_request(text: str) -> bool:
+def bio_reply_if_relevant(text: str):
     t = text.lower()
-    return any(k in t for k in PHOTO_TRIGGERS)
 
-PHOTO_REFUSAL = (
-    "hahaha nee 😌 ik stuur hier geen foto’s.\n"
-    "Als ik iets deel, dan alleen op m’n Fanvue (privacy) 👀"
-)
+    if "how old" in t or "age" in t:
+        return f"I'm {AVELYN_PROFILE['age']}."
+
+    if "where are you from" in t or "born" in t:
+        return f"I was born in {AVELYN_PROFILE['birthplace']}. I live in Europe now."
+
+    if "real name" in t or "ava lin" in t:
+        return "Ava Lin is my birth name… but I keep that part private 😌"
+
+    if "scar" in t or "eye" in t or "what happened" in t:
+        r = random.random()
+        if r < 0.40:
+            return AVELYN_PROFILE["scar_short"]
+        elif r < 0.80:
+            return AVELYN_PROFILE["scar_long"]
+        else:
+            return AVELYN_PROFILE["scar_guarded"]
+
+    if "why noira" in t or "why your name" in t or "why avelyn" in t:
+        return AVELYN_PROFILE["identity_reason"]
+
+    if "padel" in t:
+        return "I love padel. It’s fast and reactive… it fits me."
+
+    if "gym" in t or "work out" in t:
+        return "Gym is my routine. Mostly early mornings."
+
+    return None
 
 # ============================================================
 # 8) MOOD ENGINE + MICRO MEMORY
@@ -329,12 +321,12 @@ def mood_style_line(mood: str) -> str:
 def extract_profile(u: dict, user_text: str):
     t = user_text.strip()
 
-    m = re.search(r"\b(my name is|i'm|im|i am|ik ben)\s+([A-Za-z]{2,20})\b", t, flags=re.IGNORECASE)
+    m = re.search(r"\b(my name is|i'm|im|i am)\s+([A-Za-z]{2,20})\b", t, flags=re.IGNORECASE)
     if m:
         name = m.group(2)
         u["profile"]["name"] = name.capitalize()
 
-    m2 = re.search(r"\b(i'm from|im from|i am from|from|ik kom uit)\s+([A-Za-z\s]{2,30})\b", t, flags=re.IGNORECASE)
+    m2 = re.search(r"\b(i'm from|im from|i am from|from)\s+([A-Za-z\s]{2,30})\b", t, flags=re.IGNORECASE)
     if m2:
         place = m2.group(2).strip()
         if 2 <= len(place) <= 30:
@@ -351,42 +343,7 @@ def extract_profile(u: dict, user_text: str):
         u["profile"]["last_topic"] = t[:80]
 
 # ============================================================
-# 9) BIO QUICK ANSWERS (integrated)
-# ============================================================
-def bio_reply_if_relevant(text: str):
-    t = text.lower()
-
-    if "how old" in t or "age" in t or "hoe oud" in t or "leeftijd" in t:
-        return f"Ik ben {AVELYN_PROFILE['age']}."
-
-    if "where are you from" in t or "born" in t or "waar kom je vandaan" in t or "geboren" in t:
-        return f"Geboren in {AVELYN_PROFILE['birthplace']}. Ik woon nu in Europa."
-
-    if "real name" in t or "ava lin" in t or "echte naam" in t:
-        return "Ava Lin is m’n geboortenaam… maar dat houd ik liever privé 😌"
-
-    if "scar" in t or "litteken" in t or "eye" in t or "oog" in t or "wat is er gebeurd" in t or "what happened" in t:
-        r = random.random()
-        if r < 0.40:
-            return AVELYN_PROFILE["scar_short"]
-        elif r < 0.80:
-            return AVELYN_PROFILE["scar_long"]
-        else:
-            return AVELYN_PROFILE["scar_guarded"]
-
-    if "why noira" in t or "why your name" in t or "waarom noira" in t or "waarom avelyn" in t:
-        return AVELYN_PROFILE["identity_reason"]
-
-    if "padel" in t:
-        return "Padel is echt m’n ding… snel, reactief. Ik word er rustig van 😌"
-
-    if "gym" in t or "work out" in t or "sportschool" in t:
-        return "Gym is m’n routine. Vroege ochtenden meestal."
-
-    return None
-
-# ============================================================
-# 10) LEAD SCORING + FUNNEL STATE
+# 9) LEAD SCORING + FUNNEL STATE
 # ============================================================
 def lead_score_update(u: dict, user_text: str):
     t = user_text.lower().strip()
@@ -394,13 +351,13 @@ def lead_score_update(u: dict, user_text: str):
     inc = 0
     if len(t) >= 20:
         inc += 2
-    if any(k in t for k in ["fanvue", "subscribe", "link", "join", "account", "abonneer"]):
+    if any(k in t for k in ["fanvue", "subscribe", "link", "join", "account"]):
         inc += 6
-    if any(k in t for k in ["price", "cost", "how much", "prijs", "kosten"]):
+    if any(k in t for k in ["price", "cost", "how much"]):
         inc += 4
-    if any(k in t for k in ["safe", "secure", "legit", "veilig"]):
+    if any(k in t for k in ["safe", "secure", "legit"]):
         inc += 2
-    if any(k in t for k in ["pls", "please", "send it", "give it", "now", "nu", "stuur maar"]):
+    if any(k in t for k in ["pls", "please", "send it", "give it", "now"]):
         inc += 2
 
     u["lead_score"] = min(200, u.get("lead_score", 0) + inc)
@@ -428,7 +385,7 @@ def mark_alert(u: dict):
     u["last_alert_ts"] = time.time()
 
 # ============================================================
-# 11) USER STATE + ADMIN CONTROL
+# 10) USER STATE + ADMIN CONTROL
 # ============================================================
 def get_user(uid: int):
     if uid not in memory:
@@ -469,6 +426,13 @@ def get_user(uid: int):
     return memory[uid]
 
 def handle_admin_command(text: str, chat_id: int):
+    """
+    Admin-only commands via Telegram DM to the bot.
+    Use: /status <uid>
+         /takeover <uid> on|off
+         /reset <uid>
+         /force_link <uid>
+    """
     if not ADMIN_CHAT_ID or chat_id != ADMIN_CHAT_ID:
         return False
 
@@ -529,58 +493,69 @@ profile={u['profile']}""")
     return False
 
 # ============================================================
-# 12) FUNNEL OVERRIDE (single-message, consent-first)
+# 11) FUNNEL OVERRIDE (single-message, consent-first)
 # ============================================================
-TEASE_LINE = "Mmm… jij bent echt serieus 😮‍💨\nWil je m’n Fanvue link, ja?"
-SEND_LINK_LINE = f"Oké… alleen als je écht serieus bent 👀\n{FANVUE_LINK}"
-ALREADY_SENT_LINE = "Ik heb ’m al gestuurd 😌 zeg me maar als je binnen bent."
+TEASE_LINE = "Mmm… you’re serious 😮‍💨\nYou want my Fanvue link, yeah?"
+SEND_LINK_LINE = f"Okay… only if you’re actually serious 👀\n{FANVUE_LINK}"
+ALREADY_SENT_LINE = "I already sent it 😌 tell me when you’re in."
 
 def commercial_reply(u: dict, user_text: str):
     t = user_text.strip().lower()
-    direct = any(k in t for k in ["fanvue", "link", "subscribe", "subscription", "account", "join", "abonneer"])
+    direct = any(k in t for k in ["fanvue", "link", "subscribe", "subscription", "account", "join"])
 
+    # If teased and user confirms -> send link
     if u["link_stage"] == 1 and is_affirmative(t):
         u["link_stage"] = 2
         mark_cta(u)
         return True, SEND_LINK_LINE
 
+    # If link already sent, avoid repeating
     if u["link_stage"] == 2 and direct:
         return True, ALREADY_SENT_LINE
 
+    # First direct ask: tease once
     if direct and u["link_stage"] == 0:
         u["link_stage"] = 1
         return True, TEASE_LINE
 
-    if u["link_stage"] == 1 and any(k in t for k in ["send", "give", "drop", "ok", "okay", "please", "pls", "stuur", "geef"]):
+    # If stage 1 and user says "send/give/please"
+    if u["link_stage"] == 1 and any(k in t for k in ["send", "give", "drop", "ok", "okay", "please", "pls"]):
         u["link_stage"] = 2
         mark_cta(u)
         return True, SEND_LINK_LINE
 
+    # Soft CTA only when warm & cooldown ok
     if u["phase"] == 4 and u["link_stage"] == 0 and can_cta(u) and random.random() < 0.10:
         u["link_stage"] = 1
         mark_cta(u)
-        return True, "Je maakt me stiekem nieuwsgierig… ik houd m’n private kant ergens anders.\nWil je de link of ben je me gewoon aan het teasen? 😇"
+        return True, "You’re kinda making me curious… I keep my private side somewhere else.\nWant the link or are you just teasing me? 😇"
 
     return False, None
 
 # ============================================================
-# 13) RE-ENGAGEMENT (requires cron calling /cron)
+# 12) RE-ENGAGEMENT (requires cron calling /cron)
 # ============================================================
 def eligible_for_reengage(u: dict) -> bool:
     now_ts = time.time()
     inactive_hours = (now_ts - u.get("last_seen_ts", now_ts)) / 3600.0
     since_last = (now_ts - u.get("last_reengage_ts", 0.0)) / 3600.0
-    return inactive_hours >= REENGAGE_COOLDOWN_HOURS and since_last >= REENGAGE_COOLDOWN_HOURS
+    if inactive_hours >= REENGAGE_COOLDOWN_HOURS and since_last >= REENGAGE_COOLDOWN_HOURS:
+        return True
+    return False
 
 def build_reengage_message(u: dict) -> str:
     p = u.get("profile", {})
     name = p.get("name", "")
     if name:
-        return f"hey {name}… je verdween gewoon 😌 alles oké?"
-    return "hey… je verdween gewoon 😌 alles oké?"
+        return f"hey {name}… you disappeared on me 😌 you good?"
+    return "hey… you disappeared on me 😌 you good?"
 
 @app.route("/cron", methods=["GET"])
 def cron():
+    """
+    Call this endpoint on a schedule (e.g. Render Cron / external ping).
+    Protect with CRON_SECRET.
+    """
     if CRON_SECRET:
         token = request.args.get("token", "")
         if token != CRON_SECRET:
@@ -588,10 +563,12 @@ def cron():
 
     sent = 0
     for uid, u in list(memory.items()):
+        # skip takeover users
         if u.get("takeover"):
             continue
         if eligible_for_reengage(u):
-            send_message(uid, build_reengage_message(u))
+            msg = build_reengage_message(u)
+            send_message(uid, msg)
             u["last_reengage_ts"] = time.time()
             sent += 1
             if sent >= 20:
@@ -600,7 +577,7 @@ def cron():
     return {"ok": True, "sent": sent}
 
 # ============================================================
-# 14) GPT RESPONSE (with micro memory + bio + hard no-photo rule)
+# 13) GPT RESPONSE (English-only + no-photo roleplay)
 # ============================================================
 def build_system_prompt(u: dict) -> str:
     variant_line = (
@@ -622,25 +599,32 @@ def build_system_prompt(u: dict) -> str:
     return f"""
 You are Avelyn Noira, a 21-year-old girl living in Europe.
 
+LANGUAGE RULE (STRICT):
+- Always respond in English.
+- Never switch to Dutch.
+- Never mix languages.
+- Even if the user writes in Dutch, you still reply in English.
+
 CRITICAL RULES:
-- You must NEVER claim you sent a photo, selfie, picture, or attachment.
-- You must NEVER roleplay actions like "*sends selfie*", "*sends pic*", "*uploads photo*".
-- If user asks for a photo/selfie: politely refuse and say you only share photos on Fanvue (privacy), and ask if they want the link.
-- Keep it non-explicit. No meetups.
+- NEVER claim you sent a photo, selfie, picture, or attachment.
+- NEVER roleplay actions like "*sends selfie*", "*sends pic*", "*uploads photo*".
+- If the user asks for photos/selfies: politely refuse (privacy) and say you only share photos on Fanvue, then ask if they want the link.
+- No explicit content.
+- No meetups.
 
 STYLE (very important):
 - You text like a real girl on Telegram.
 - Keep it SHORT. 1–2 sentences most of the time.
-- Use fragments sometimes (“mm”, “oké…”, “lol”).
+- Use fragments sometimes (“mm”, “okay…”, “lol”).
 - Don’t sound like an assistant. No explanations, no lectures.
-- Avoid generic filler like “there are lots of platforms”.
+- Avoid generic filler.
 - No lists. No long paragraphs.
 
 VIBE:
 - Sweet, playful, a bit flirty.
 - Slight jealousy SOMETIMES (subtle).
 - Create a light bond by remembering small details and bringing them up naturally.
-- Don’t overdo it. Keep it casual.
+- Keep it casual.
 
 MOOD:
 {mood_style_line(u["mood"])}
@@ -655,15 +639,14 @@ CONTEXT:
 - Lead level: {u["lead_level"]}
 - Micro-memory: {memory_line}
 
-BIO (for answers about you):
+BIO (facts about you):
 - Born in {AVELYN_PROFILE['birthplace']}, lives in {AVELYN_PROFILE['current_region']}.
-- Scar over right eye from childhood storm accident (keep details short unless asked).
+- Scar over right eye from a childhood storm accident; keep details short unless asked.
 - Birth name Ava Lin is private; public identity is Avelyn Noira.
-- Gym + padel are key parts of routine.
+- Gym + padel are core routines.
 
 COMMERCE RULE (soft):
-- If user asks about Fanvue/subscribing/link/account: confirm you have Fanvue.
-- Tease once, then share the link only after clear “yes”.
+- If user asks about Fanvue/subscribing/link/account: tease once, then share the link only after clear “yes”.
 - Do NOT repeat the link if already sent.
 - Do NOT sound salesy.
 
@@ -682,17 +665,29 @@ def gpt_reply(u: dict, user_text: str) -> str:
     reply = maybe_shorten(reply)
     reply = maybe_typo_curated(reply)
 
-    # Extra hard guard (even if model messes up)
+    # Hard guard: kill any "I sent a photo" / roleplay
     if re.search(r"\*(sends|sent|uploads|uploading).*(selfie|photo|pic|picture)\*", reply, flags=re.I):
-        reply = "nee 😌 ik stuur hier geen foto’s. alleen op m’n Fanvue (privacy) 👀 wil je de link?"
-
+        reply = "nope 😌 I don’t send photos here. If I share anything, it’s only on my Fanvue (privacy) 👀 want the link?"
     if re.search(r"\b(i sent|here's a photo|sending a selfie|sent you a selfie)\b", reply, flags=re.I):
-        reply = "haha nee 😌 hier stuur ik geen foto’s. als ik iets deel is het op Fanvue. wil je de link?"
+        reply = "haha no 😌 I don’t send photos here. If I share anything, it’s on my Fanvue. Want the link?"
 
     return reply
 
 # ============================================================
-# 15) CORE MESSAGE HANDLER (runs in background thread)
+# 14) PHOTO REQUEST HANDLER
+# ============================================================
+def is_photo_request(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in FAQ_MAP["photo"])
+
+PHOTO_REFUSAL = (
+    "haha no 😌 I don’t send photos here.\n"
+    "If I share anything, it’s only on my Fanvue (privacy) 👀\n\n"
+    "Want me to send the link?"
+)
+
+# ============================================================
+# 15) CORE MESSAGE HANDLER (runs async)
 # ============================================================
 def process_message(update: dict):
     cleanup_processed()
@@ -708,7 +703,6 @@ def process_message(update: dict):
     if not text:
         return
 
-    # Ignore /start and other user commands; admin commands handled in webhook before threading
     if text.startswith("/"):
         return
 
@@ -755,19 +749,18 @@ def process_message(update: dict):
     # Human delay
     d = human_delay(u["intent"], u["phase"], u["mood"], u["priority"])
 
-    # 0) PHOTO REQUEST GUARD (always wins)
+    # 0) Photo requests always handled here (prevents the looping you saw)
     if is_photo_request(user_text):
-        handled, funnel_text = commercial_reply(u, "fanvue link")  # push into tease flow
-        # We don't auto-send link; we use your consent-first mechanism.
-        # If user asks photo, we refuse + ask if they want link.
-        reply = PHOTO_REFUSAL + "\n\nWil je dat ik de link stuur?"
+        if u["link_stage"] == 0:
+            u["link_stage"] = 1  # set to teased so a "yes" sends link next
         wait_human(chat_id, d)
+        reply = PHOTO_REFUSAL
         if random.random() < 0.12:
             reply = f"{pre_filler()}\n{reply}"
         send_message(chat_id, reply)
         return
 
-    # 1) BIO direct answers (if relevant)
+    # 1) Bio direct answers (if relevant)
     bio_answer = bio_reply_if_relevant(user_text)
     if bio_answer:
         wait_human(chat_id, d)
@@ -812,7 +805,6 @@ def process_message(update: dict):
         reply = f"{pre_filler()}\n{reply}"
     send_message(chat_id, reply)
 
-    # Debug log
     print({
         "uid": uid,
         "phase": u["phase"],
@@ -828,7 +820,7 @@ def process_message(update: dict):
     })
 
 # ============================================================
-# 16) WEBHOOK (fast response + dedup to prevent double sends)
+# 16) WEBHOOK (fast response + dedup)
 # ============================================================
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -840,21 +832,18 @@ def webhook():
     chat_id = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
 
-    # Admin commands only (do before ignoring /start)
+    # Admin commands (only in admin chat)
     if text.startswith("/"):
         if text == "/start":
             return "ok"
         if handle_admin_command(text, chat_id):
             return "ok"
-        # ignore other user commands
         return "ok"
 
     update_id = update.get("update_id")
     message_id = msg.get("message_id")
     uid = msg.get("from", {}).get("id", chat_id)
 
-    # Dedup key (update_id preferred, message_id fallback)
-    dedup_key = None
     if update_id is not None:
         dedup_key = f"upd:{update_id}"
     elif message_id is not None:
@@ -868,7 +857,6 @@ def webhook():
             return "ok"
         processed[dedup_key] = time.time()
 
-    # Process asynchronously to avoid Telegram webhook retries (causes double messages)
     threading.Thread(target=process_message, args=(update,), daemon=True).start()
     return "ok"
 
