@@ -1,8 +1,7 @@
 import os
-import requests
 import time
 import random
-from datetime import datetime
+import requests
 from flask import Flask, request
 from openai import OpenAI
 
@@ -16,36 +15,38 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 FANVUE_LINK = "https://www.fanvue.com/avelynnoira/fv-7"
 
+# Memory per user
 memory = {}
 
-# -------------------------
-# USER STATE
-# -------------------------
+SYSTEM_PROMPT = """
+You are Avelyn Noira.
 
-def get_user(chat_id):
-    if chat_id not in memory:
-        memory[chat_id] = {
-            "messages": 0,
-            "warm": 0,
-            "phase": 1,
-            "intent": "casual",
-            "engagement_score": 0,
-            "priority_user": False,
-            "link_sent": False,
-            "last_seen": datetime.utcnow(),
-            "history": []
-        }
-    return memory[chat_id]
+Personality:
+- Sweet
+- Playful
+- Slight girlfriend energy
+- Natural texting style
+- Short messages
+- Slight emotional unpredictability
 
-# -------------------------
-# TELEGRAM HELPERS
-# -------------------------
+Rules:
+- No explicit content
+- No meetups
+- Never immediately drop links
+- Only suggest exclusive content when user is warm and engaged
+- Keep it human and imperfect
+"""
 
-def send_typing(chat_id):
+# ------------------------
+# Telegram helpers
+# ------------------------
+
+def send_typing(chat_id, duration=2):
     requests.post(f"{BASE_URL}/sendChatAction", json={
         "chat_id": chat_id,
         "action": "typing"
     })
+    time.sleep(duration)
 
 def send_message(chat_id, text):
     requests.post(f"{BASE_URL}/sendMessage", json={
@@ -53,76 +54,57 @@ def send_message(chat_id, text):
         "text": text
     })
 
-# -------------------------
-# HUMANIZATION LAYER
-# -------------------------
+# ------------------------
+# Human behavior layer
+# ------------------------
 
-def human_delay(text, phase):
-    if phase == 1:
-        base = random.uniform(2,4)
-    elif phase == 2:
-        base = random.uniform(4,7)
-    else:
-        base = random.uniform(5,9)
+def human_delay(text_length):
+    base = random.uniform(1.5, 3.5)
+    variable = min(text_length / 25, 4)
+    return base + variable + random.uniform(0.5, 2.0)
 
-    length_factor = len(text) * 0.02
-    return min(base + length_factor, 10)
+def maybe_split_message(text):
+    if len(text) > 80 and random.random() < 0.5:
+        split_point = len(text) // 2
+        return [text[:split_point], text[split_point:]]
+    return [text]
 
-def maybe_typo(text):
-    if random.random() < 0.01 and len(text) > 12:
-        i = random.randint(0, len(text)-2)
-        return text[:i] + text[i+1] + text[i] + text[i+2:]
+def maybe_add_imperfection(text):
+    if random.random() < 0.1:
+        return text.replace("you", "u", 1)
     return text
 
-def maybe_split_message(chat_id, text, phase):
-    if random.random() < 0.25 and ". " in text:
-        parts = text.split(". ")
-        first = parts[0] + "."
-        second = ". ".join(parts[1:])
+# ------------------------
+# Warmth logic
+# ------------------------
 
-        send_typing(chat_id)
-        time.sleep(human_delay(first, phase))
-        send_message(chat_id, first)
+def update_engagement(user_id, message):
+    if user_id not in memory:
+        memory[user_id] = {
+            "messages": 0,
+            "engagement": 0,
+            "phase": 1
+        }
 
-        send_typing(chat_id)
-        time.sleep(random.uniform(2,4))
-        send_message(chat_id, second)
-        return True
-    return False
+    memory[user_id]["messages"] += 1
 
-def maybe_filler(chat_id):
-    if random.random() < 0.2:
-        filler = random.choice([
-            "Hmm...",
-            "Wait...",
-            "Hold on...",
-            "You’re trouble.",
-            "Why are you like this..."
-        ])
-        send_typing(chat_id)
-        time.sleep(random.uniform(2,4))
-        send_message(chat_id, filler)
-        time.sleep(random.uniform(1.5,3))
+    triggers = ["love", "miss", "babe", "baby", "exclusive", "private"]
+    if any(word in message.lower() for word in triggers):
+        memory[user_id]["engagement"] += 2
+    else:
+        memory[user_id]["engagement"] += 1
 
-# -------------------------
-# INTENT DETECTION
-# -------------------------
+    if memory[user_id]["engagement"] > 6:
+        memory[user_id]["phase"] = 2
 
-def detect_intent(text):
-    t = text.lower()
-    if any(w in t for w in ["subscribe","private","fanvue","onlyfans","link"]):
-        return "buyer_intent"
-    if any(w in t for w in ["nudes","send pic","show me"]):
-        return "curious"
-    if any(w in t for w in ["cute","hot","beautiful","miss you","want you"]):
-        return "flirty"
-    if len(t) < 5:
-        return "low_effort"
-    return "casual"
+def maybe_offer_fanvue(user_id):
+    if memory[user_id]["phase"] == 2 and random.random() < 0.3:
+        return f"I post more private things here sometimes… only if you're curious though 👀\n{FANVUE_LINK}"
+    return None
 
-# -------------------------
-# WEBHOOK
-# -------------------------
+# ------------------------
+# Webhook
+# ------------------------
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -131,94 +113,50 @@ def webhook():
     if "message" not in data:
         return "ok"
 
-    chat_id = data["message"]["chat"]["id"]
-    user_text = data["message"].get("text", "")
+    message = data["message"]
+    chat_id = message["chat"]["id"]
+    user_id = message["from"]["id"]
+    user_text = message.get("text", "")
 
-    user = get_user(chat_id)
-    user["messages"] += 1
-    user["last_seen"] = datetime.utcnow()
-    user["intent"] = detect_intent(user_text)
-    user["engagement_score"] += len(user_text) * 0.1
+    if not user_text:
+        return "ok"
 
-    if user["messages"] > 15:
-        user["priority_user"] = True
-
-    if any(w in user_text.lower() for w in ["private","more","exclusive","subscribe"]):
-        user["warm"] += 1
-
-    # Phase logic
-    if user["messages"] < 5:
-        user["phase"] = 1
-    elif user["warm"] >= 1 and user["messages"] >= 6:
-        user["phase"] = 4
-    else:
-        user["phase"] = 2
-
-    # Save history
-    user["history"].append({"role": "user", "content": user_text})
-    user["history"] = user["history"][-8:]
-
-    system_prompt = f"""
-You are Avelyn Noira.
-
-Talk like a real girl texting.
-Short messages. Sometimes one sentence.
-Sometimes vague.
-Sometimes emotional instead of informative.
-Leave mystery.
-Occasional emoji.
-Slight jealousy sometimes.
-Never robotic.
-
-Remember things he shares and bring them up later.
-
-User intent: {user["intent"]}
-Conversation phase: {user["phase"]}
-
-Phase 1:
-Light teasing.
-
-Phase 2:
-Emotional bonding and exclusivity.
-
-Phase 4:
-If clearly interested:
-First say:
-"I don't really share everything here..."
-Then:
-"I keep my private side somewhere else."
-If confirmed:
-"So I know you're serious... {FANVUE_LINK}"
-Never drop link randomly.
-"""
+    update_engagement(user_id, user_text)
 
     response = client.responses.create(
         model="gpt-4.1-mini",
-        max_output_tokens=160,
         input=[
-            {"role": "system", "content": system_prompt},
-            *user["history"]
-        ]
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_text}
+        ],
+        max_output_tokens=120
     )
 
-    reply_text = response.output_text.strip()
-    reply_text = maybe_typo(reply_text)
+    reply = response.output_text.strip()
+    reply = maybe_add_imperfection(reply)
 
-    user["history"].append({"role": "assistant", "content": reply_text})
+    # Simulate thinking
+    delay = human_delay(len(reply))
+    send_typing(chat_id, min(delay, 5))
 
-    maybe_filler(chat_id)
+    messages = maybe_split_message(reply)
 
-    if not maybe_split_message(chat_id, reply_text, user["phase"]):
-        send_typing(chat_id)
-        time.sleep(human_delay(reply_text, user["phase"]))
-        send_message(chat_id, reply_text)
+    for part in messages:
+        send_message(chat_id, part)
+        time.sleep(random.uniform(0.5, 1.5))
 
-    print({
-        "chat_id": chat_id,
-        "intent": user["intent"],
-        "phase": user["phase"],
-        "engagement": user["engagement_score"],
-        "priority": user["priority_user"]
-    })
+    # Optional soft upsell
+    fanvue_offer = maybe_offer_fanvue(user_id)
+    if fanvue_offer:
+        time.sleep(random.uniform(2, 4))
+        send_typing(chat_id, 2)
+        send_message(chat_id, fanvue_offer)
 
     return "ok"
+
+# ------------------------
+# Render binding
+# ------------------------
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
