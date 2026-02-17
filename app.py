@@ -22,6 +22,10 @@ memory = {}
 AB_VARIANTS = ["A", "B"]
 MOODS = ["playful", "soft", "busy", "jealous_light", "tired"]
 
+# De-dup for Telegram retries (in-memory, TTL-like)
+processed = {}  # message_id -> timestamp
+PROCESSED_TTL_SECONDS = 60 * 10  # 10 min
+
 
 # -------------------------
 # Telegram helpers
@@ -71,6 +75,13 @@ def wait_human(chat_id: int, total_seconds: float):
 # -------------------------
 # Humanization utilities
 # -------------------------
+def cleanup_processed():
+    now = time.time()
+    stale = [k for k, ts in processed.items() if (now - ts) > PROCESSED_TTL_SECONDS]
+    for k in stale:
+        processed.pop(k, None)
+
+
 def maybe_typo(text: str) -> str:
     # ~1% small typo (swap 2 chars)
     if random.random() < 0.01 and len(text) > 14:
@@ -80,48 +91,18 @@ def maybe_typo(text: str) -> str:
 
 
 def maybe_shorten(text: str) -> str:
-    """
-    Reduce GPT-ish longness. Keep it chatty and short.
-    """
     t = " ".join(text.split())
-    # hard cap length
     if len(t) > 240:
         t = t[:240].rsplit(" ", 1)[0] + "…"
-    # discourage lists / heavy formatting
     t = t.replace("\n\n", "\n").replace("- ", "")
     return t
 
 
-def maybe_split(text: str):
-    """
-    Sometimes send in two messages like a human.
-    """
-    if random.random() < 0.28 and ". " in text and len(text) > 60:
-        parts = text.split(". ")
-        first = parts[0].strip() + "."
-        rest = ". ".join(parts[1:]).strip()
-        if len(rest) < 5:
-            return None, text
-        return first, rest
-    return None, text
-
-
 def pre_filler():
-    return random.choice(["Hmm…", "Wait…", "Okay hold on…", "You’re trouble 😮‍💨", "Lol okay…"])
+    return random.choice(["Hmm…", "Wait…", "Okay hold on…", "Lol okay…", "Mmm…"])
 
 
 def human_delay(phase: int, intent: str, mood: str) -> float:
-    """
-    Extreme human timing:
-    - Phase 1: 3–9s
-    - Phase 2: 6–16s
-    - Phase 4 (warm): 9–20s
-
-    Mood:
-    - busy -> slightly faster
-    - soft/tired -> slightly slower
-    Buyer intent -> slightly faster (still human).
-    """
     if phase == 1:
         d = random.uniform(3.0, 9.0)
     elif phase == 2:
@@ -165,6 +146,17 @@ def warm_trigger(text: str) -> bool:
     return any(x in t for x in triggers)
 
 
+def is_affirmative(text: str) -> bool:
+    t = text.strip().lower()
+    yes = {
+        "yes", "y", "yeah", "yep", "sure", "ok", "okay", "send", "send it", "give", "give it",
+        "pls", "please", "drop it", "go on", "do it"
+    }
+    # allow short confirmations like "yes." "ok!"
+    t2 = "".join([c for c in t if c.isalnum() or c.isspace()]).strip()
+    return t in yes or t2 in yes
+
+
 # -------------------------
 # Mood engine (Option B)
 # -------------------------
@@ -172,18 +164,15 @@ def update_mood(u: dict, user_text: str):
     t = user_text.strip()
     u["last_user_len"] = len(t)
 
-    # detect short spam streak
     if len(t) <= 4:
         u["short_streak"] = min(u.get("short_streak", 0) + 1, 10)
     else:
         u["short_streak"] = max(u.get("short_streak", 0) - 1, 0)
 
-    # base mood rules
     if u["short_streak"] >= 3:
         u["mood"] = "busy"
         return
 
-    # some natural tired mood occasionally in longer convos
     if u["messages"] >= 10 and random.random() < 0.06:
         u["mood"] = "tired"
         return
@@ -231,7 +220,6 @@ def get_user(uid: int):
             "link_stage": 0,  # 0 none, 1 teased, 2 link sent
             "history": [],
             "last_seen": datetime.utcnow().isoformat(),
-            # option B
             "variant": random.choice(AB_VARIANTS),
             "mood": "playful",
             "last_user_len": 0,
@@ -241,32 +229,42 @@ def get_user(uid: int):
 
 
 # -------------------------
-# Commercial overrides (direct + decisive)
+# Commercial overrides (single-message safe)
 # -------------------------
 def commercial_reply(u: dict, user_text: str):
     """
-    Returns (handled: bool, text_to_send: str or None)
+    Returns (handled: bool, reply_text: str or None)
+    This version fixes:
+    - "Yes" after tease -> should send link
+    - Avoids weird GPT fallback
     """
-    t = user_text.lower()
-    intent = u["intent"]
+    t = user_text.strip().lower()
 
-    direct = any(k in t for k in ["fanvue", "link", "subscribe", "subscription", "account", "join"])
+    # If we already teased and user confirms (even just "Yes"), send link.
+    if u["link_stage"] == 1 and is_affirmative(t):
+        u["link_stage"] = 2
+        return True, f"Okay… only if you’re actually serious 👀\n{FANVUE_LINK}"
 
-    # If user directly asks for Fanvue / link / subscribe: do not waffle.
-    if intent == "buyer_intent" and direct:
-        if u["link_stage"] == 0:
-            u["link_stage"] = 1
-            return True, "Mmm… you’re really about it 😮‍💨\nYou want my Fanvue link, yeah?"
-        if u["link_stage"] == 1:
-            if any(x in t for x in ["yes", "yeah", "yep", "send", "give", "drop", "pls", "please", "ok"]):
-                u["link_stage"] = 2
-                return True, f"Okay… only if you’re actually serious 👀\n{FANVUE_LINK}"
-            return True, "Say the word 😌 do you want it?"
-        if u["link_stage"] == 2:
+    # If link already sent, avoid re-sending; guide.
+    if u["link_stage"] == 2:
+        if any(k in t for k in ["link", "fanvue", "subscribe", "sub"]):
             return True, "I already sent it 😌 tell me when you’re in."
 
-    # If warm and link not teased yet: occasional soft steer (not spam)
-    if u["phase"] == 4 and u["link_stage"] == 0 and random.random() < 0.18:
+    # Detect direct buyer asks
+    direct = any(k in t for k in ["fanvue", "link", "subscribe", "subscription", "account", "join"])
+
+    # First time direct ask: tease once
+    if direct and u["link_stage"] == 0:
+        u["link_stage"] = 1
+        return True, "Mmm… you’re really about it 😮‍💨\nYou want my Fanvue link, yeah?"
+
+    # If user says "send it / give it" while stage 1, treat as confirmation too
+    if u["link_stage"] == 1 and any(k in t for k in ["send", "give", "drop", "ok", "okay", "please", "pls"]):
+        u["link_stage"] = 2
+        return True, f"Okay… only if you’re actually serious 👀\n{FANVUE_LINK}"
+
+    # Soft steer only sometimes when very warm
+    if u["phase"] == 4 and u["link_stage"] == 0 and random.random() < 0.14:
         u["link_stage"] = 1
         return True, "You’re making me curious… I keep my more private side somewhere else.\nYou want that link or you just teasing me? 😇"
 
@@ -278,14 +276,23 @@ def commercial_reply(u: dict, user_text: str):
 # -------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
-    if not data or "message" not in data:
+    cleanup_processed()
+
+    update = request.get_json(silent=True) or {}
+    msg = update.get("message")
+
+    if not msg:
         return "ok"
 
-    msg = data["message"]
+    message_id = msg.get("message_id")
+    if message_id is not None:
+        if message_id in processed:
+            return "ok"
+        processed[message_id] = time.time()
+
     chat_id = msg["chat"]["id"]
     uid = msg.get("from", {}).get("id", chat_id)
-    user_text = msg.get("text", "")
+    user_text = (msg.get("text") or "").strip()
 
     if not user_text:
         return "ok"
@@ -311,7 +318,6 @@ def webhook():
     if u["messages"] >= 18 or u["engagement"] >= 30:
         u["priority"] = True
 
-    # Update mood
     update_mood(u, user_text)
 
     # Save history (last 10 turns)
@@ -325,18 +331,17 @@ def webhook():
         else "Variant B: softer girlfriend vibe, more reassuring, slightly more affectionate."
     )
 
-    # 1) Commercial override (pre-GPT)
-    handled, text = commercial_reply(u, user_text)
-    if handled and text:
+    # 1) Commercial override FIRST (pre-GPT)
+    handled, reply_text = commercial_reply(u, user_text)
+    if handled and reply_text:
         d = human_delay(u["phase"], u["intent"], u["mood"])
+        wait_human(chat_id, d)
 
-        # sometimes a filler before main reply
-        if random.random() < 0.22:
-            wait_human(chat_id, random.uniform(2.0, 6.0))
-            send_message(chat_id, pre_filler())
+        # SINGLE MESSAGE ONLY: optionally prefix filler into same message (not separate)
+        if random.random() < 0.18:
+            reply_text = f"{pre_filler()}\n{reply_text}"
 
-        wait_human(chat_id, min(d, 12.0))
-        send_message(chat_id, text)
+        send_message(chat_id, reply_text)
 
         print(
             {
@@ -366,7 +371,6 @@ STYLE (very important):
 - Don’t sound like an assistant. No explanations, no lectures.
 - Avoid generic phrases like “there are lots of platforms”.
 - No lists. No long paragraphs.
-- Occasional emoji, not every message.
 
 VIBE:
 - Sweet, playful, a bit flirty.
@@ -387,14 +391,11 @@ CONTEXT:
 - Intent: {u["intent"]}
 - Phase: {u["phase"]} (1=light, 2=bonding, 4=warm)
 - Warm count: {u["warm"]}
-- Priority user: {u["priority"]}
 
 COMMERCE RULE:
-- If the user asks about Fanvue/subscribing/link/account:
-  respond directly and confidently as if you DO have one.
-  Do NOT list other platforms.
-  If they ask for the link: tease once then share.
-- Do NOT spam the link. If already shared, say “I already sent it 😌”.
+- If the user asks about Fanvue/subscribing/link/account: respond directly (you do have one).
+- If they ask for the link: tease once then share.
+- If you already sent it, do not repeat it.
 
 Write the next message now.
 """.strip()
@@ -405,30 +406,21 @@ Write the next message now.
         input=[{"role": "system", "content": system_prompt}, *u["history"]],
     )
 
-    reply = resp.output_text.strip()
+    reply = (resp.output_text or "").strip()
     reply = maybe_shorten(reply)
     reply = maybe_typo(reply)
 
-    # Save assistant turn
     u["history"].append({"role": "assistant", "content": reply})
     u["history"] = u["history"][-10:]
 
-    # 3) Human send pattern
-    if random.random() < 0.20:
-        wait_human(chat_id, random.uniform(2.0, 6.0))
-        send_message(chat_id, pre_filler())
-
     d = human_delay(u["phase"], u["intent"], u["mood"])
-    part1, part2 = maybe_split(reply)
+    wait_human(chat_id, d)
 
-    if part1:
-        wait_human(chat_id, d)
-        send_message(chat_id, part1)
-        wait_human(chat_id, random.uniform(2.0, 7.0))
-        send_message(chat_id, part2)
-    else:
-        wait_human(chat_id, d)
-        send_message(chat_id, reply)
+    # SINGLE MESSAGE ONLY:
+    if random.random() < 0.14:
+        reply = f"{pre_filler()}\n{reply}"
+
+    send_message(chat_id, reply)
 
     print(
         {
