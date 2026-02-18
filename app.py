@@ -1,313 +1,483 @@
+"""
+app.py — Human-feel Telegram assistant that softly converts to Fanvue.
+
+Key upgrades added (per your request):
+- Funnel framework: COLD -> WARM -> HOT per user
+- Intent detection + stage progression logic
+- A "planner" step: the model outputs JSON (intent, stage, best next move, reply draft)
+- Guardrails: short, human, no em-dash, no bullets, no scripted sales lines
+- Soft Fanvue guidance ONLY when user is warm/hot or explicitly asks
+- Link is only sent on explicit request (or user asks "link/url")
+
+Install:
+  pip install flask requests python-dotenv
+
+Env vars:
+  TELEGRAM_BOT_TOKEN=...
+  OPENAI_API_KEY=...
+  FANVUE_LINK=https://...
+  OPENAI_MODEL=gpt-4.1-mini   (or better)
+  PORT=8080
+"""
+
 import os
-import time
 import re
 import json
+import time
 import random
+from dataclasses import dataclass, asdict
 from collections import defaultdict, deque
+from typing import Dict, Any, Optional, Tuple
 
 import requests
 from flask import Flask, request, jsonify
+
 
 # -----------------------------
 # Config
 # -----------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-
-# Set your Fanvue link here (only sent on explicit request or high intent)
-FANVUE_LINK = os.getenv("FANVUE_LINK", "https://www.fanvue.com/avelvnnoira/").strip()
-
-# If you use OpenAI Responses API, set endpoint accordingly.
-# This file uses the OpenAI "Responses API"-style endpoint via HTTPS request.
 OPENAI_RESPONSES_URL = os.getenv("OPENAI_RESPONSES_URL", "https://api.openai.com/v1/responses").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()  # upgrade if you can
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+
+FANVUE_LINK = os.getenv("FANVUE_LINK", "https://www.fanvue.com/avelvnnoira/").strip()
 
 # Human-feel tuning
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.9"))
 TOP_P = float(os.getenv("TOP_P", "0.9"))
 PRESENCE_PENALTY = float(os.getenv("PRESENCE_PENALTY", "0.6"))
 
-# Memory size per user
-HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "14"))
+HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "16"))
+
+# Safety/boundaries
+NO_MEETUPS_TEXT = "Dat doen we niet, sorry. Wel gewoon online chat. Waar was je precies naar op zoek?"
+
 
 # -----------------------------
 # App
 # -----------------------------
 app = Flask(__name__)
 
-# In-memory chat history: user_id -> deque of {role, content}
-history = defaultdict(lambda: deque(maxlen=HISTORY_TURNS))
+# Conversation memory (per Telegram user)
+history: Dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_TURNS))
 
-# Lightweight per-user state
-user_state = defaultdict(dict)
+# Lightweight user state (stage, counters, last topics)
+user_state: Dict[int, Dict[str, Any]] = defaultdict(dict)
+
 
 # -----------------------------
-# Helpers
+# Helpers: Telegram
 # -----------------------------
-def tg_send_message(chat_id: int, text: str, reply_to_message_id=None):
+def tg_send_message(chat_id: int, text: str, reply_to_message_id: Optional[int] = None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
     return requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=15)
 
+
+# -----------------------------
+# Helpers: Text / Intent
+# -----------------------------
 def normalize_text(s: str) -> str:
-    s = s.strip()
+    s = (s or "").strip()
     s = re.sub(r"\s+", " ", s)
     return s
 
+
 def contains_link_request(text: str) -> bool:
-    t = text.lower()
-    return any(k in t for k in ["link", "url", "send link", "drop link", "fanvue link", "where can i subscribe", "where can i join"])
+    t = (text or "").lower()
+    keys = ["link", "url", "send link", "drop link", "fanvue link", "where can i subscribe", "where can i join"]
+    return any(k in t for k in keys)
 
-def detect_intent(text: str) -> str:
-    """
-    Very practical intent classifier.
-    You can replace with an LLM classifier later, but rules are fast and reliable.
-    """
-    t = text.lower().strip()
 
-    # Meetup / location requests (we refuse gently)
-    meetup_keys = ["meet", "meetup", "date", "come over", "come to", "where are you", "where is she", "location", "address"]
+def detect_intent_rulebased(text: str) -> str:
+    """
+    Fast routing. The planner model will refine, but this keeps behavior stable.
+    """
+    t = (text or "").lower().strip()
+
+    meetup_keys = ["meet", "meetup", "date", "come over", "come to", "address", "where are you", "location"]
     if any(k in t for k in meetup_keys):
         return "MEETUP"
 
-    # 1-on-1 / private chat
     private_keys = ["1 on 1", "1-on-1", "private", "dm", "direct message", "talk to her", "chat with her", "can i talk"]
     if any(k in t for k in private_keys):
         return "PRIVATE_CHAT"
 
-    # customs / requests
-    custom_keys = ["custom", "request", "personalized", "can you make", "can she do", "specific", "video for me", "pic for me"]
+    custom_keys = ["custom", "request", "personalized", "can you make", "specific", "video for me", "pic for me"]
     if any(k in t for k in custom_keys):
         return "CUSTOMS"
 
-    # What is on Fanvue / pricing / content
     fanvue_keys = ["fanvue", "what can i expect", "what do i get", "what is on", "subscription", "price", "cost", "worth it"]
     if any(k in t for k in fanvue_keys):
         return "FANVUE_INFO"
 
-    # Confusion / bot suspicion
-    bot_keys = ["are you a bot", "bot", "script", "automated", "real", "is this you"]
-    if any(k in t for k in bot_keys):
+    trust_keys = ["are you a bot", "bot", "script", "automated", "real", "is this you"]
+    if any(k in t for k in trust_keys):
         return "TRUST"
 
-    # Default
     return "CASUAL"
 
+
+def strip_ai_tells(text: str) -> str:
+    """
+    Remove common AI tells:
+    - em-dash
+    - bullets
+    - overly formatted list style
+    """
+    text = (text or "").replace("—", "")
+    text = re.sub(r"(?m)^\s*[-•]\s+", "", text)
+    text = re.sub(r"(?m)^\s*\d+\.\s+", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def add_human_micro_variation(text: str) -> str:
+    """
+    Small, controlled human-like variation. Avoid cringe.
+    """
+    if not text:
+        return text
+
+    # Occasionally add a tiny interjection at the start
+    if random.random() < 0.14 and len(text) < 220:
+        inserts = ["haha", "snap ik", "fair", "oké"]
+        pick = random.choice(inserts)
+        if not text.lower().startswith(tuple(inserts)):
+            text = f"{pick}. {text}"
+
+    # Avoid too many emojis
+    if text.count("😊") + text.count("😉") + text.count("😅") > 1:
+        text = re.sub(r"[😊😉😅]", "", text).strip()
+
+    return text
+
+
 def is_repetitive(user_id: int, candidate: str) -> bool:
-    """
-    Detect if candidate response is too close to last assistant message.
-    """
     past = [m["content"] for m in history[user_id] if m["role"] == "assistant"]
     if not past:
         return False
     last = past[-1]
-    # crude similarity: shared bigrams
-    def bigrams(x):
+
+    def bigrams(x: str):
         x = normalize_text(x.lower())
-        return set([x[i:i+2] for i in range(len(x)-1)])
+        return set([x[i : i + 2] for i in range(len(x) - 1)])
+
     a, b = bigrams(candidate), bigrams(last)
     if not a or not b:
         return False
     jacc = len(a & b) / max(1, len(a | b))
     return jacc > 0.68
 
-def strip_ai_tells(text: str) -> str:
-    """
-    Remove common AI tells:
-    - em-dash
-    - bullet formatting
-    - overly polished lines
-    """
-    text = text.replace("—", "")
-    # Remove leading bullets or numbering
-    text = re.sub(r"(?m)^\s*[-•]\s+", "", text)
-    text = re.sub(r"(?m)^\s*\d+\.\s+", "", text)
-    # Avoid double newlines spam
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
 
-def add_human_micro_variation(text: str) -> str:
-    """
-    Adds subtle human-like elements without forcing it.
-    """
-    # Occasionally add a tiny interjection
-    if random.random() < 0.18 and len(text) < 220:
-        inserts = ["haha", "2 sec", "snap ik", "fair", "oké"]
-        pick = random.choice(inserts)
-        # Put it at start only if it fits
-        if not text.lower().startswith(tuple(inserts)):
-            text = f"{pick}. {text}"
-    # Keep max 4 lines
-    lines = text.splitlines()
-    if len(lines) > 4:
-        text = " ".join(lines)
-    return text
+# -----------------------------
+# Funnel / Stage Logic
+# -----------------------------
+FUNNEL_STAGES = ("COLD", "WARM", "HOT")
 
-def should_soft_direct_to_fanvue(intent: str, text: str) -> bool:
+
+def get_stage(user_id: int) -> str:
+    stage = user_state[user_id].get("stage")
+    if stage not in FUNNEL_STAGES:
+        stage = "COLD"
+    return stage
+
+
+def set_stage(user_id: int, stage: str):
+    if stage in FUNNEL_STAGES:
+        user_state[user_id]["stage"] = stage
+
+
+def bump_stage(user_id: int, new_stage: str):
+    current = get_stage(user_id)
+    order = {s: i for i, s in enumerate(FUNNEL_STAGES)}
+    if order.get(new_stage, 0) > order.get(current, 0):
+        set_stage(user_id, new_stage)
+
+
+def update_stage_from_signal(user_id: int, intent: str, text: str):
     """
-    Only allow Fanvue direction if user shows interest (high intent),
-    or explicitly asks.
+    Move users through funnel based on signals:
+    - COLD: casual hi, random chat
+    - WARM: asking what she offers, content, pricing, personal questions
+    - HOT: asking 1-on-1, customs, link, how to subscribe
     """
+    t = (text or "").lower()
+
+    if intent in {"FANVUE_INFO", "TRUST"}:
+        bump_stage(user_id, "WARM")
+
+    if intent in {"PRIVATE_CHAT", "CUSTOMS"}:
+        bump_stage(user_id, "HOT")
+
     if contains_link_request(text):
-        return True
-    return intent in {"PRIVATE_CHAT", "CUSTOMS", "FANVUE_INFO"}
+        bump_stage(user_id, "HOT")
 
-def system_prompt() -> str:
+    # Extra signal words
+    warm_words = ["what do you do", "what can i", "tell me", "content", "posts", "price", "cost", "worth"]
+    hot_words = ["subscribe", "join", "dm", "private chat", "custom", "request", "link", "where do i"]
+
+    if any(w in t for w in hot_words):
+        bump_stage(user_id, "HOT")
+    elif any(w in t for w in warm_words):
+        bump_stage(user_id, "WARM")
+
+
+def should_mention_fanvue(user_id: int, intent: str, user_text: str) -> bool:
+    """
+    Soft guidance rule:
+    - Always ok if user asked directly (fanvue / 1-on-1 / custom / pricing)
+    - Otherwise only if stage is WARM/HOT and it's relevant
+    """
+    if contains_link_request(user_text):
+        return True
+    if intent in {"FANVUE_INFO", "PRIVATE_CHAT", "CUSTOMS"}:
+        return True
+    stage = get_stage(user_id)
+    return stage in {"WARM", "HOT"} and intent in {"CASUAL", "TRUST"}
+
+
+def should_send_link(user_text: str) -> bool:
+    """
+    Hard rule: only send link if explicitly requested.
+    """
+    return contains_link_request(user_text)
+
+
+# -----------------------------
+# Planner (Model outputs JSON plan)
+# -----------------------------
+@dataclass
+class Plan:
+    intent: str
+    stage: str
+    goal: str
+    reply: str
+    ask_followup: bool = True
+    followup: str = ""
+    mention_fanvue: bool = False
+    send_link: bool = False
+
+
+def system_prompt_planner() -> str:
     return (
-        "You are Mina, Avelyn's human assistant, typing on Telegram.\n"
-        "You must sound like a real person, not a script.\n\n"
-        "Hard rules:\n"
-        "- Keep replies short: 1 to 4 short lines.\n"
-        "- Answer the user's question directly first.\n"
-        "- Ask at most one light follow-up question sometimes.\n"
-        "- Never use em dashes (—) and do not use bullet lists.\n"
-        "- Avoid corporate sales words (premium, exclusive, unlock, magic, full access).\n"
-        "- Do not push Fanvue unless the user shows interest or asks.\n"
-        "- Mention Fanvue at most once per message.\n"
-        "- Never mention Ava Lin.\n"
-        "- No meetups. If asked, politely refuse and offer online options.\n\n"
-        "Tone:\n"
-        "- Casual, warm, slightly playful.\n"
-        "- Small imperfections are okay.\n"
-        "- Do not over-explain.\n"
+        "You are Mina, Avelyn's HUMAN assistant typing on Telegram.\n"
+        "Your job: understand what the chatter means and answer like a real person.\n"
+        "You also aim to convert to Fanvue naturally, but only when it fits.\n\n"
+        "Hard style rules:\n"
+        "1) Keep replies short: 1 to 4 short lines.\n"
+        "2) Answer the question directly first.\n"
+        "3) Ask at most one short follow-up question sometimes.\n"
+        "4) Never use em dashes (—) and never use bullet lists.\n"
+        "5) Avoid scripted sales words: premium, exclusive, unlock, magic, full access.\n"
+        "6) Do not mention Ava Lin.\n"
+        "7) No meetups. If asked, refuse politely and offer online.\n"
+        "8) Mention Fanvue at most once per message.\n"
+        "9) Only send the link if the user explicitly asks for the link.\n\n"
+        "Output MUST be valid JSON ONLY (no extra text).\n"
+        "JSON keys: intent, stage, goal, reply, ask_followup, followup, mention_fanvue, send_link.\n"
+        "Make reply feel human, not like a script.\n"
     )
 
-def build_user_context(intent: str, user_text: str) -> str:
-    """
-    Provide additional guidance without sounding scripted.
-    """
-    # A small intent-specific nudge, not a template paragraph
-    if intent == "MEETUP":
-        return "User is asking for meetup/location. Refuse politely. Offer online chat instead."
-    if intent == "TRUST":
-        return "User doubts if this is real. Explain briefly you're her assistant and she sometimes reads along."
-    if intent == "FANVUE_INFO":
-        return "User wants details. Give 2-3 concrete examples of what she posts. Keep it simple."
-    if intent == "PRIVATE_CHAT":
-        return "User wants 1-on-1. Say DM is best on Fanvue. Ask what they want to chat about."
-    if intent == "CUSTOMS":
-        return "User asks about custom requests. Ask what they have in mind and mention it can be arranged on Fanvue."
-    return "Keep it conversational and respond naturally."
 
-def openai_generate(user_id: int, intent: str, user_text: str) -> str:
-    """
-    Calls OpenAI Responses API (HTTP) with memory.
-    """
-    # Build input messages
-    messages = [{"role": "system", "content": system_prompt()}]
+def build_context_messages(user_id: int, rule_intent: str, user_text: str) -> list:
+    stage = get_stage(user_id)
 
-    # Add lightweight "developer" style context as system message
-    messages.append({"role": "system", "content": build_user_context(intent, user_text)})
+    # Provide model with current stage + rule intent + small constraints.
+    meta = (
+        f"Current funnel stage: {stage}.\n"
+        f"Rule-based intent guess: {rule_intent}.\n"
+        "Guidance on stages:\n"
+        "- COLD: keep it friendly, no pushing.\n"
+        "- WARM: give concrete info, light curiosity.\n"
+        "- HOT: help them take the next step naturally.\n"
+        "Remember: Fanvue only when relevant; link only if asked.\n"
+    )
 
-    # Add chat history
+    messages = [{"role": "system", "content": system_prompt_planner()}]
+    messages.append({"role": "system", "content": meta})
+
+    # Add recent chat history
     for m in history[user_id]:
         messages.append(m)
 
-    # Add current user message
     messages.append({"role": "user", "content": user_text})
+    return messages
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
 
-    # Responses API format
+def openai_plan(user_id: int, rule_intent: str, user_text: str) -> Plan:
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    messages = build_context_messages(user_id, rule_intent, user_text)
+
     payload = {
         "model": OPENAI_MODEL,
         "input": messages,
         "temperature": TEMPERATURE,
         "top_p": TOP_P,
-        "presence_penalty": PRESENCE_PENALTY
+        "presence_penalty": PRESENCE_PENALTY,
+        # Encourage structured output
+        "response_format": {"type": "json_object"},
     }
 
     r = requests.post(OPENAI_RESPONSES_URL, headers=headers, json=payload, timeout=25)
     r.raise_for_status()
     data = r.json()
 
-    # Extract output text (handles common Responses schema)
+    # Extract text from Responses API
     out = ""
     if "output" in data and isinstance(data["output"], list):
-        # Find the first text content
         for item in data["output"]:
             if item.get("type") == "message":
-                content = item.get("content", [])
-                for c in content:
+                for c in item.get("content", []):
                     if c.get("type") == "output_text":
                         out += c.get("text", "")
     if not out:
-        # fallback older schema
         out = data.get("output_text") or data.get("text") or ""
 
-    return out.strip()
+    out = out.strip()
 
-def finalize_reply(user_id: int, intent: str, user_text: str, draft: str) -> str:
-    text = strip_ai_tells(draft)
+    # Parse JSON robustly
+    try:
+        obj = json.loads(out)
+    except Exception:
+        # Fallback if model returned something slightly off
+        obj = {
+            "intent": rule_intent,
+            "stage": get_stage(user_id),
+            "goal": "respond_naturally",
+            "reply": out[:400],
+            "ask_followup": True,
+            "followup": "Wat bedoel je precies?",
+            "mention_fanvue": False,
+            "send_link": False,
+        }
 
-    # If model tries to push Fanvue when it shouldn't, soften/remove
-    if not should_soft_direct_to_fanvue(intent, user_text):
-        # Remove "fanvue" lines if present
+    # Build plan with defaults
+    plan = Plan(
+        intent=str(obj.get("intent", rule_intent)).upper(),
+        stage=str(obj.get("stage", get_stage(user_id))).upper(),
+        goal=str(obj.get("goal", "respond_naturally")),
+        reply=str(obj.get("reply", "")).strip(),
+        ask_followup=bool(obj.get("ask_followup", True)),
+        followup=str(obj.get("followup", "")).strip(),
+        mention_fanvue=bool(obj.get("mention_fanvue", False)),
+        send_link=bool(obj.get("send_link", False)),
+    )
+
+    # Normalize stage to known values
+    if plan.stage not in FUNNEL_STAGES:
+        plan.stage = get_stage(user_id)
+
+    return plan
+
+
+# -----------------------------
+# Finalization / Guardrails
+# -----------------------------
+def finalize_reply(user_id: int, plan: Plan, user_text: str, rule_intent: str) -> str:
+    intent = plan.intent or rule_intent
+    stage = get_stage(user_id)
+
+    # Hard meetup refusal
+    if rule_intent == "MEETUP" or intent == "MEETUP":
+        return NO_MEETUPS_TEXT
+
+    # Decide whether we allow Fanvue mention
+    allow_fanvue = should_mention_fanvue(user_id, rule_intent, user_text)
+    send_link = should_send_link(user_text)
+
+    # Build base text
+    reply = strip_ai_tells(plan.reply)
+
+    # Enforce: no link unless explicitly requested
+    reply = re.sub(r"https?://\S+", "", reply).strip()
+
+    # Optionally add follow-up question (one)
+    followup = strip_ai_tells(plan.followup or "").strip()
+    if plan.ask_followup and followup:
+        # Ensure it is a question, short
+        if len(followup) > 90:
+            followup = followup[:90].rsplit(" ", 1)[0] + "?"
+        if not followup.endswith("?"):
+            followup = followup.rstrip(".") + "?"
+    else:
+        followup = ""
+
+    # Keep it short (max ~4 lines)
+    parts = []
+    if reply:
+        parts.append(reply)
+
+    if followup:
+        parts.append(followup)
+
+    text = "\n".join([p for p in parts if p]).strip()
+
+    # If the model tried to push Fanvue but it's not allowed, remove references
+    if not allow_fanvue:
         if "fanvue" in text.lower():
-            text = re.sub(r"(?i).*fanvue.*(\n|$)", "", text).strip()
+            text = re.sub(r"(?i)\bfanvue\b", "", text).strip()
+            text = normalize_text(text)
             if not text:
                 text = "Snap ik. Waar ben je precies benieuwd naar?"
 
-    # If intent requires a refusal
-    if intent == "MEETUP":
-        # Force a consistent boundary, still human
-        text = "Dat doen we niet, sorry. Wel gewoon online chat.\nWaar was je precies naar op zoek?"
-
-    # Avoid sending raw link unless requested
-    if "http" in text.lower() and not contains_link_request(user_text):
-        text = re.sub(r"https?://\S+", " ", text).strip()
-
-    # If user explicitly asks for link, include it once
-    if contains_link_request(user_text):
-        # Keep it natural, no pitch
-        base = text if text else "Tuurlijk. Hier is de link."
-        # Ensure link is present only once
-        base = re.sub(r"https?://\S+", "", base).strip()
-        text = f"{base}\n{FANVUE_LINK}".strip()
-
-    # Keep short
-    text = normalize_text(text)
-    # Reintroduce line breaks for readability (human)
-    if len(text) > 170:
-        # split into 2-3 lines max based on punctuation
-        parts = re.split(r"([.!?])\s+", text)
-        rebuilt = ""
-        line = ""
-        lines = []
-        for i in range(0, len(parts), 2):
-            seg = parts[i].strip()
-            punct = parts[i+1] if i+1 < len(parts) else ""
-            sentence = (seg + punct).strip()
-            if not sentence:
-                continue
-            if len(line) + len(sentence) + 1 < 70:
-                line = (line + " " + sentence).strip()
+    # If Fanvue mention is allowed, keep it natural and only once
+    if allow_fanvue:
+        # If user asked about 1-on-1/customs/fanvue, we allow 1 mention.
+        # If reply doesn't mention it but it would help, add a soft line depending on intent/stage.
+        if "fanvue" not in text.lower() and rule_intent in {"PRIVATE_CHAT", "CUSTOMS", "FANVUE_INFO"}:
+            # Soft, no hype
+            add = "Als je 1-op-1 wil of iets persoonlijks, dan kan dat het makkelijkst via Fanvue."
+            # Keep within 4 lines
+            if text:
+                text = f"{text}\n{add}"
             else:
-                if line:
-                    lines.append(line)
-                line = sentence
-            if len(lines) >= 3:
-                break
-        if line and len(lines) < 3:
-            lines.append(line)
-        text = "\n".join(lines).strip()
+                text = add
 
-    # Add subtle human variation
+        # Ensure only one 'Fanvue' word appears
+        # If it appears multiple times, collapse to first
+        occurrences = len(re.findall(r"(?i)\bfanvue\b", text))
+        if occurrences > 1:
+            # Remove all but first
+            first = re.search(r"(?i)\bfanvue\b", text)
+            if first:
+                before = text[: first.end()]
+                after = re.sub(r"(?i)\bfanvue\b", "", text[first.end():])
+                text = (before + after).strip()
+                text = normalize_text(text)
+
+    # Add link only if explicitly requested
+    if send_link:
+        # Avoid sales pitch, just comply
+        if text:
+            text = f"{text}\n{FANVUE_LINK}".strip()
+        else:
+            text = f"Tuurlijk.\n{FANVUE_LINK}".strip()
+
+    # Human micro-variation + anti repetition
     text = add_human_micro_variation(text)
 
-    # Anti repetition: if too similar, nudge variation
+    # If too repetitive, force a different line
     if is_repetitive(user_id, text):
-        text = "Snap ik. Vertel eens, wat zoek je precies, meer chat of meer content?"
+        text = "Snap ik. Wat zoek je vooral, chat of iets specifieks?"
+
+    # Final cleanup: no em-dash, no bullets
+    text = strip_ai_tells(text)
+
+    # Prevent super long messages
+    text = text.strip()
+    if len(text) > 500:
+        text = text[:500].rsplit(" ", 1)[0].strip()
 
     return text
 
+
 # -----------------------------
-# Telegram Webhook
+# Webhook
 # -----------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -323,31 +493,42 @@ def webhook():
         return jsonify({"ok": True})
 
     user_text = text.strip()
-    intent = detect_intent(user_text)
 
-    # Store user message into history
+    # 1) Rule-based intent
+    rule_intent = detect_intent_rulebased(user_text)
+
+    # 2) Update funnel stage from the new signal BEFORE planning
+    update_stage_from_signal(user_id, rule_intent, user_text)
+
+    # 3) Store user message in history
     history[user_id].append({"role": "user", "content": user_text})
 
-    # Generate response
+    # 4) Get plan from model (JSON)
     try:
-        draft = openai_generate(user_id, intent, user_text)
-    except Exception as e:
-        # Fail gracefully
+        plan = openai_plan(user_id, rule_intent, user_text)
+    except Exception:
         reply = "Oeps, ik liep even vast. Stuur je vraag nog een keer kort?"
         tg_send_message(chat_id, reply, reply_to_message_id=message.get("message_id"))
         return jsonify({"ok": True})
 
-    reply = finalize_reply(user_id, intent, user_text, draft)
+    # 5) Apply plan stage update (model suggestion), but never downgrade
+    if plan.stage in FUNNEL_STAGES:
+        bump_stage(user_id, plan.stage)
 
-    # Store assistant reply into history
+    # 6) Finalize reply with guardrails
+    reply = finalize_reply(user_id, plan, user_text, rule_intent)
+
+    # 7) Store assistant reply in history
     history[user_id].append({"role": "assistant", "content": reply})
 
     tg_send_message(chat_id, reply, reply_to_message_id=message.get("message_id"))
     return jsonify({"ok": True})
 
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
 
 if __name__ == "__main__":
     if not TELEGRAM_BOT_TOKEN:
