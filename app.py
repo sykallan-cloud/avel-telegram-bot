@@ -698,6 +698,11 @@ def gpt_reply(u: dict) -> str:
     reply = sanitize_reply(reply)
     return reply
 
+#==========================================
+# 10) ALIVE
+@app.route("/", methods=["GET"])
+def home():
+    return {"status": "alive"}, 200
 # ============================================================
 # 11) WEBHOOK
 # ============================================================
