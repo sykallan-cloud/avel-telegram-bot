@@ -1,540 +1,650 @@
-"""
-app.py — Human-feel Telegram assistant that softly converts to Fanvue.
-
-Key upgrades added (per your request):
-- Funnel framework: COLD -> WARM -> HOT per user
-- Intent detection + stage progression logic
-- A "planner" step: the model outputs JSON (intent, stage, best next move, reply draft)
-- Guardrails: short, human, no em-dash, no bullets, no scripted sales lines
-- Soft Fanvue guidance ONLY when user is warm/hot or explicitly asks
-- Link is only sent on explicit request (or user asks "link/url")
-
-Install:
-  pip install flask requests python-dotenv
-
-Env vars:
-  TELEGRAM_BOT_TOKEN=...
-  OPENAI_API_KEY=...
-  FANVUE_LINK=https://...
-  OPENAI_MODEL=gpt-4.1-mini   (or better)
-  PORT=8080
-"""
-
 import os
-import re
-import json
 import time
 import random
-from dataclasses import dataclass, asdict
-from collections import defaultdict, deque
-from typing import Dict, Any, Optional, Tuple
-
+import re
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, abort
+from openai import OpenAI
 
-
-# -----------------------------
-# Config
-# -----------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_RESPONSES_URL = os.getenv("OPENAI_RESPONSES_URL", "https://api.openai.com/v1/responses").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
-
-FANVUE_LINK = os.getenv("FANVUE_LINK", "https://www.fanvue.com/avelvnnoira/").strip()
-
-# Human-feel tuning
-TEMPERATURE = float(os.getenv("TEMPERATURE", "0.9"))
-TOP_P = float(os.getenv("TOP_P", "0.9"))
-PRESENCE_PENALTY = float(os.getenv("PRESENCE_PENALTY", "0.6"))
-
-HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "16"))
-
-# Safety/boundaries
-NO_MEETUPS_TEXT = "Dat doen we niet, sorry. Wel gewoon online chat. Waar was je precies naar op zoek?"
-
-
-# -----------------------------
-# App
-# -----------------------------
 app = Flask(__name__)
 
-# Conversation memory (per Telegram user)
-history: Dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_TURNS))
+# ============================================================
+# 0) CONFIG
+# ============================================================
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
-# Lightweight user state (stage, counters, last topics)
-user_state: Dict[int, Dict[str, Any]] = defaultdict(dict)
+# Put your Telegram numeric chat id in Render env as ADMIN_CHAT_ID
+# Tip: use a separate private channel/group for alerts and set its chat_id here
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))  # optional
+CRON_SECRET = os.environ.get("CRON_SECRET", "")           # optional (recommended)
 
+BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# -----------------------------
-# Helpers: Telegram
-# -----------------------------
-def tg_send_message(chat_id: int, text: str, reply_to_message_id: Optional[int] = None):
-    payload = {"chat_id": chat_id, "text": text}
-    if reply_to_message_id:
-        payload["reply_to_message_id"] = reply_to_message_id
-    return requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=15)
+FANVUE_LINK = "https://www.fanvue.com/avelynnoira/fv-7"
 
+MODEL = "gpt-4.1-mini"
+MAX_OUTPUT_TOKENS = 190
 
-# -----------------------------
-# Helpers: Text / Intent
-# -----------------------------
-def normalize_text(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
+# Anti-dup + anti-spam
+PROCESSED_TTL_SECONDS = 60 * 10
+MAX_MSGS_PER_MINUTE = 7
 
+# Cooldowns
+ALERT_COOLDOWN_MINUTES = 25
+REENGAGE_COOLDOWN_HOURS = 24
 
-def contains_link_request(text: str) -> bool:
-    t = (text or "").lower()
-    keys = ["link", "url", "send link", "drop link", "fanvue link", "where can i subscribe", "where can i join"]
-    return any(k in t for k in keys)
+# History size
+HISTORY_TURNS = 14
 
+# Human timing
+MAX_DELAY_SECONDS = 22.0
 
-def detect_intent_rulebased(text: str) -> str:
+# ============================================================
+# 0.1) BIO (used only when relevant)
+# ============================================================
+AVELYN_BIO = """
+Avelyn Noira is 21 years old.
+She was born in Chengdu, China, under her birth name, Ava Lin, a name that belongs to her private history.
+
+From an early age, she was observant, quiet, attentive to small movements others ignored.
+When she was four, a metal advertising panel loosened during a storm and struck her.
+A sharp edge cut downward across her face from her brow, over her right eye, and along her cheek.
+Emergency surgery saved her eye, but partial vision loss remained. The vertical scar never fully faded.
+
+Growing up, the scar brought questions and stares. She stopped explaining and adapted.
+She became sharper and more aware, relying on positioning, instinct, and anticipation rather than perfect sight.
+Structure became her stability. The gym gave repetition, repetition gave control.
+
+In her late teens, she discovered padel, a fast sport demanding timing and spatial awareness.
+After moving to Europe, she chose to redefine herself publicly and became Avelyn Noira.
+Avelyn is the public identity. Ava remains private.
+
+Today, her life is structured and intentional, early mornings, training, padel, calm routines.
+The scar is visible. It does not ask for sympathy. It is simply part of her story.
+""".strip()
+
+# ============================================================
+# 1) IN MEMORY STATE (Render restart resets)
+# ============================================================
+memory = {}      # uid -> user_state dict
+processed = {}   # key -> ts  (dedup store)
+
+AB_VARIANTS = ["A", "B"]
+
+# ============================================================
+# 2) TELEGRAM HELPERS
+# ============================================================
+def tg_post(method: str, payload: dict):
+    try:
+        return requests.post(f"{BASE_URL}/{method}", json=payload, timeout=12).json()
+    except Exception:
+        return None
+
+def send_message(chat_id: int, text: str):
+    tg_post("sendMessage", {"chat_id": chat_id, "text": text})
+
+def send_typing(chat_id: int):
+    tg_post("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+
+def notify_admin(text: str):
+    if ADMIN_CHAT_ID and int(ADMIN_CHAT_ID) != 0:
+        send_message(ADMIN_CHAT_ID, f"[ALERT] {text}")
+
+# ============================================================
+# 3) HOUSEKEEPING: DE DUP + RATE LIMIT
+# ============================================================
+def cleanup_processed():
+    now = time.time()
+    stale = [k for k, ts in processed.items() if (now - ts) > PROCESSED_TTL_SECONDS]
+    for k in stale:
+        processed.pop(k, None)
+
+def allow_rate(u: dict) -> bool:
+    now = time.time()
+    window = u.setdefault("rate_window", [])
+    window = [t for t in window if now - t < 60]
+    u["rate_window"] = window
+    if len(window) >= MAX_MSGS_PER_MINUTE:
+        return False
+    window.append(now)
+    return True
+
+# ============================================================
+# 4) HUMANIZATION (24/7)
+# ============================================================
+def pre_filler():
+    # single message prefix, no double send
+    return random.choice(["Hmm…", "Wait…", "Okay hold on…", "Lol okay…", "Mmm…", "Alright…"])
+
+def wait_human(chat_id: int, total_seconds: float):
+    total_seconds = max(0.0, float(total_seconds))
+    total_seconds = min(total_seconds, MAX_DELAY_SECONDS)
+
+    seen_delay = min(random.uniform(0.4, 2.2), total_seconds)
+    time.sleep(seen_delay)
+    remaining = total_seconds - seen_delay
+
+    while remaining > 0:
+        burst = min(random.uniform(1.6, 4.6), remaining)
+        send_typing(chat_id)
+        time.sleep(burst)
+        remaining -= burst
+        if remaining <= 0:
+            break
+        pause = min(random.uniform(0.4, 1.6), remaining)
+        time.sleep(pause)
+        remaining -= pause
+
+def human_delay(intent: str, phase: int, priority: bool) -> float:
+    if intent == "buyer_intent":
+        d = random.uniform(2.5, 8.0)
+    elif phase >= 2:
+        d = random.uniform(4.5, 13.0)
+    else:
+        d = random.uniform(6.0, 16.5)
+
+    if priority:
+        d = max(2.0, d - random.uniform(0.5, 3.0))
+
+    d += random.uniform(0.0, 2.0)
+    return min(d, MAX_DELAY_SECONDS)
+
+def maybe_shorten(text: str) -> str:
+    t = " ".join(text.split())
+    if len(t) > 260:
+        t = t[:260].rsplit(" ", 1)[0] + "…"
+    return t
+
+def maybe_typo_curated(text: str) -> str:
+    # small human micro typos, low rate
+    if random.random() > 0.025:
+        return text
+    replacements = [
+        ("you", "u"),
+        ("okay", "ok"),
+        ("really", "rly"),
+        ("because", "bc"),
+        ("i'm", "im"),
+        ("i am", "im"),
+        ("your", "ur"),
+    ]
+    out = text
+    for a, b in replacements:
+        if re.search(rf"\b{re.escape(a)}\b", out, flags=re.IGNORECASE) and random.random() < 0.35:
+            out = re.sub(rf"\b{re.escape(a)}\b", b, out, count=1, flags=re.IGNORECASE)
+    return out
+
+def sanitize_reply(text: str) -> str:
     """
-    Fast routing. The planner model will refine, but this keeps behavior stable.
-    """
-    t = (text or "").lower().strip()
-
-    meetup_keys = ["meet", "meetup", "date", "come over", "come to", "address", "where are you", "location"]
-    if any(k in t for k in meetup_keys):
-        return "MEETUP"
-
-    private_keys = ["1 on 1", "1-on-1", "private", "dm", "direct message", "talk to her", "chat with her", "can i talk"]
-    if any(k in t for k in private_keys):
-        return "PRIVATE_CHAT"
-
-    custom_keys = ["custom", "request", "personalized", "can you make", "specific", "video for me", "pic for me"]
-    if any(k in t for k in custom_keys):
-        return "CUSTOMS"
-
-    fanvue_keys = ["fanvue", "what can i expect", "what do i get", "what is on", "subscription", "price", "cost", "worth it"]
-    if any(k in t for k in fanvue_keys):
-        return "FANVUE_INFO"
-
-    trust_keys = ["are you a bot", "bot", "script", "automated", "real", "is this you"]
-    if any(k in t for k in trust_keys):
-        return "TRUST"
-
-    return "CASUAL"
-
-
-def strip_ai_tells(text: str) -> str:
-    """
-    Remove common AI tells:
-    - em-dash
-    - bullets
-    - overly formatted list style
-    """
-    text = (text or "").replace("—", "")
-    text = re.sub(r"(?m)^\s*[-•]\s+", "", text)
-    text = re.sub(r"(?m)^\s*\d+\.\s+", "", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def add_human_micro_variation(text: str) -> str:
-    """
-    Small, controlled human-like variation. Avoid cringe.
+    Requirements:
+    - English only (we enforce in prompt too)
+    - No dash bullet vibe, remove standalone '-' or em dash usage in replies
     """
     if not text:
-        return text
+        return ""
 
-    # Occasionally add a tiny interjection at the start
-    if random.random() < 0.14 and len(text) < 220:
-        inserts = ["haha", "snap ik", "fair", "oké"]
-        pick = random.choice(inserts)
-        if not text.lower().startswith(tuple(inserts)):
-            text = f"{pick}. {text}"
+    t = text.strip()
 
-    # Avoid too many emojis
-    if text.count("😊") + text.count("😉") + text.count("😅") > 1:
-        text = re.sub(r"[😊😉😅]", "", text).strip()
+    # Remove common list/bullet patterns
+    t = re.sub(r"(?m)^\s*[-•]\s*", "", t)
 
-    return text
+    # Avoid "assistant-y" separators
+    t = t.replace("—", ", ")
+    t = t.replace(" - ", " ")
+    t = t.replace("\n-\n", "\n")
+    t = re.sub(r"(?m)^\s*-\s*$", "", t)
 
+    # Clean extra newlines
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
 
-def is_repetitive(user_id: int, candidate: str) -> bool:
-    past = [m["content"] for m in history[user_id] if m["role"] == "assistant"]
-    if not past:
-        return False
-    last = past[-1]
+    return t
 
-    def bigrams(x: str):
-        x = normalize_text(x.lower())
-        return set([x[i : i + 2] for i in range(len(x) - 1)])
+# ============================================================
+# 5) INTENT + FAQ
+# ============================================================
+FAQ_MAP = {
+    "price": ["price", "how much", "cost", "pricing"],
+    "safe": ["safe", "secure", "scam", "legit"],
+    "what_you_get": ["what do i get", "whats inside", "what’s inside", "what do you post", "content", "what is on", "what do you share"],
+    "cancel": ["cancel", "refund", "unsubscribe", "stop"],
+    "link": ["link", "fanvue", "subscribe", "subscription", "join", "account"],
+    "bio": ["where are you from", "chengdu", "scar", "your eye", "your story", "who are you", "tell me about you", "background"],
+}
+FAQ_REPLIES = {
+    "price": "It’s the normal sub price on my page, you’ll see it before you confirm anything.",
+    "safe": "Yep, it’s official and you stay inside the platform. You can cancel anytime.",
+    "what_you_get": "On Fanvue it’s the full private side, personal drops, customs, and real replies from Avelyn.",
+    "cancel": "You can cancel anytime on the platform, no drama.",
+}
 
-    a, b = bigrams(candidate), bigrams(last)
-    if not a or not b:
-        return False
-    jacc = len(a & b) / max(1, len(a | b))
-    return jacc > 0.68
+def detect_intent(text: str) -> str:
+    t = text.lower()
+    fan_keywords = ["fanvue", "subscribe", "subscription", "sub", "link", "account", "join", "sign up"]
+    spicy = ["spicy", "nudes", "nsfw", "explicit", "sex", "porn"]
+    photo = ["photo", "pic", "pics", "selfie", "snap", "send a picture", "send me a photo"]
+    loweffort = ["hi", "hey", "yo", "sup", "hello"]
 
+    if any(k in t for k in fan_keywords):
+        return "buyer_intent"
+    if any(k in t for k in spicy) or any(k in t for k in photo):
+        return "buyer_intent"
+    if t.strip() in loweffort or len(t.strip()) <= 3:
+        return "low_effort"
+    return "casual"
 
-# -----------------------------
-# Funnel / Stage Logic
-# -----------------------------
-FUNNEL_STAGES = ("COLD", "WARM", "HOT")
+def match_faq(text: str):
+    t = text.lower()
+    for key, kws in FAQ_MAP.items():
+        if any(k in t for k in kws):
+            return key
+    return None
 
+def is_link_ask(text: str) -> bool:
+    t = text.lower().strip()
+    return any(k in t for k in ["send link", "the link", "your link", "drop the link", "fanvue link", "give me the link", "link please", "link pls", "where is the link", "subscribe link"])
 
-def get_stage(user_id: int) -> str:
-    stage = user_state[user_id].get("stage")
-    if stage not in FUNNEL_STAGES:
-        stage = "COLD"
-    return stage
-
-
-def set_stage(user_id: int, stage: str):
-    if stage in FUNNEL_STAGES:
-        user_state[user_id]["stage"] = stage
-
-
-def bump_stage(user_id: int, new_stage: str):
-    current = get_stage(user_id)
-    order = {s: i for i, s in enumerate(FUNNEL_STAGES)}
-    if order.get(new_stage, 0) > order.get(current, 0):
-        set_stage(user_id, new_stage)
-
-
-def update_stage_from_signal(user_id: int, intent: str, text: str):
-    """
-    Move users through funnel based on signals:
-    - COLD: casual hi, random chat
-    - WARM: asking what she offers, content, pricing, personal questions
-    - HOT: asking 1-on-1, customs, link, how to subscribe
-    """
-    t = (text or "").lower()
-
-    if intent in {"FANVUE_INFO", "TRUST"}:
-        bump_stage(user_id, "WARM")
-
-    if intent in {"PRIVATE_CHAT", "CUSTOMS"}:
-        bump_stage(user_id, "HOT")
-
-    if contains_link_request(text):
-        bump_stage(user_id, "HOT")
-
-    # Extra signal words
-    warm_words = ["what do you do", "what can i", "tell me", "content", "posts", "price", "cost", "worth"]
-    hot_words = ["subscribe", "join", "dm", "private chat", "custom", "request", "link", "where do i"]
-
-    if any(w in t for w in hot_words):
-        bump_stage(user_id, "HOT")
-    elif any(w in t for w in warm_words):
-        bump_stage(user_id, "WARM")
-
-
-def should_mention_fanvue(user_id: int, intent: str, user_text: str) -> bool:
-    """
-    Soft guidance rule:
-    - Always ok if user asked directly (fanvue / 1-on-1 / custom / pricing)
-    - Otherwise only if stage is WARM/HOT and it's relevant
-    """
-    if contains_link_request(user_text):
-        return True
-    if intent in {"FANVUE_INFO", "PRIVATE_CHAT", "CUSTOMS"}:
-        return True
-    stage = get_stage(user_id)
-    return stage in {"WARM", "HOT"} and intent in {"CASUAL", "TRUST"}
-
-
-def should_send_link(user_text: str) -> bool:
-    """
-    Hard rule: only send link if explicitly requested.
-    """
-    return contains_link_request(user_text)
-
-
-# -----------------------------
-# Planner (Model outputs JSON plan)
-# -----------------------------
-@dataclass
-class Plan:
-    intent: str
-    stage: str
-    goal: str
-    reply: str
-    ask_followup: bool = True
-    followup: str = ""
-    mention_fanvue: bool = False
-    send_link: bool = False
-
-
-def system_prompt_planner() -> str:
-    return (
-        "You are Mina, Avelyn's HUMAN assistant typing on Telegram.\n"
-        "Your job: understand what the chatter means and answer like a real person.\n"
-        "You also aim to convert to Fanvue naturally, but only when it fits.\n\n"
-        "Hard style rules:\n"
-        "1) Keep replies short: 1 to 4 short lines.\n"
-        "2) Answer the question directly first.\n"
-        "3) Ask at most one short follow-up question sometimes.\n"
-        "4) Never use em dashes (—) and never use bullet lists.\n"
-        "5) Avoid scripted sales words: premium, exclusive, unlock, magic, full access.\n"
-        "6) Do not mention Ava Lin.\n"
-        "7) No meetups. If asked, refuse politely and offer online.\n"
-        "8) Mention Fanvue at most once per message.\n"
-        "9) Only send the link if the user explicitly asks for the link.\n\n"
-        "Output MUST be valid JSON ONLY (no extra text).\n"
-        "JSON keys: intent, stage, goal, reply, ask_followup, followup, mention_fanvue, send_link.\n"
-        "Make reply feel human, not like a script.\n"
-    )
-
-
-def build_context_messages(user_id: int, rule_intent: str, user_text: str) -> list:
-    stage = get_stage(user_id)
-
-    # Provide model with current stage + rule intent + small constraints.
-    meta = (
-        f"Current funnel stage: {stage}.\n"
-        f"Rule-based intent guess: {rule_intent}.\n"
-        "Guidance on stages:\n"
-        "- COLD: keep it friendly, no pushing.\n"
-        "- WARM: give concrete info, light curiosity.\n"
-        "- HOT: help them take the next step naturally.\n"
-        "Remember: Fanvue only when relevant; link only if asked.\n"
-    )
-
-    messages = [{"role": "system", "content": system_prompt_planner()}]
-    messages.append({"role": "system", "content": meta})
-
-    # Add recent chat history
-    for m in history[user_id]:
-        messages.append(m)
-
-    messages.append({"role": "user", "content": user_text})
-    return messages
-
-
-def openai_plan(user_id: int, rule_intent: str, user_text: str) -> Plan:
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    messages = build_context_messages(user_id, rule_intent, user_text)
-
-    payload = {
-        "model": OPENAI_MODEL,
-        "input": messages,
-        "temperature": TEMPERATURE,
-        "top_p": TOP_P,
-        "presence_penalty": PRESENCE_PENALTY,
-        # Encourage structured output
-        "response_format": {"type": "json_object"},
+def is_affirmative(text: str) -> bool:
+    t = text.strip().lower()
+    t2 = re.sub(r"[^a-z0-9\s]", "", t).strip()
+    yes = {
+        "yes", "y", "yeah", "yep", "sure", "ok", "okay", "alright",
+        "send it", "drop it", "give it", "go ahead", "pls", "please", "why not"
     }
+    return (t in yes) or (t2 in yes)
 
-    r = requests.post(OPENAI_RESPONSES_URL, headers=headers, json=payload, timeout=25)
-    r.raise_for_status()
-    data = r.json()
+# ============================================================
+# 6) FUNNEL STATE + ADMIN
+# ============================================================
+def should_alert(u: dict) -> bool:
+    return (time.time() - u.get("last_alert_ts", 0.0)) > (ALERT_COOLDOWN_MINUTES * 60)
 
-    # Extract text from Responses API
-    out = ""
-    if "output" in data and isinstance(data["output"], list):
-        for item in data["output"]:
-            if item.get("type") == "message":
-                for c in item.get("content", []):
-                    if c.get("type") == "output_text":
-                        out += c.get("text", "")
-    if not out:
-        out = data.get("output_text") or data.get("text") or ""
+def mark_alert(u: dict):
+    u["last_alert_ts"] = time.time()
 
-    out = out.strip()
+def get_user(uid: int):
+    if uid not in memory:
+        memory[uid] = {
+            "messages": 0,
+            "phase": 1,
+            "intent": "casual",
+            "priority": False,
 
-    # Parse JSON robustly
-    try:
-        obj = json.loads(out)
-    except Exception:
-        # Fallback if model returned something slightly off
-        obj = {
-            "intent": rule_intent,
-            "stage": get_stage(user_id),
-            "goal": "respond_naturally",
-            "reply": out[:400],
-            "ask_followup": True,
-            "followup": "Wat bedoel je precies?",
-            "mention_fanvue": False,
-            "send_link": False,
+            # funnel
+            "link_stage": 0,   # 0 none, 1 offered, 2 sent
+            "last_link_ts": 0.0,
+
+            # admin
+            "takeover": False,
+            "last_alert_ts": 0.0,
+
+            # convo
+            "history": [],
+            "rate_window": [],
+            "variant": random.choice(AB_VARIANTS),
+
+            # micro memory
+            "profile": {"name": "", "place": "", "interests": [], "last_topic": ""},
         }
+    return memory[uid]
 
-    # Build plan with defaults
-    plan = Plan(
-        intent=str(obj.get("intent", rule_intent)).upper(),
-        stage=str(obj.get("stage", get_stage(user_id))).upper(),
-        goal=str(obj.get("goal", "respond_naturally")),
-        reply=str(obj.get("reply", "")).strip(),
-        ask_followup=bool(obj.get("ask_followup", True)),
-        followup=str(obj.get("followup", "")).strip(),
-        mention_fanvue=bool(obj.get("mention_fanvue", False)),
-        send_link=bool(obj.get("send_link", False)),
+def handle_admin_command(text: str, chat_id: int):
+    if not ADMIN_CHAT_ID or int(ADMIN_CHAT_ID) == 0 or chat_id != ADMIN_CHAT_ID:
+        return False
+
+    parts = text.strip().split()
+    cmd = parts[0].lower()
+
+    def usage():
+        send_message(chat_id, "Commands:\n/status <uid>\n/takeover <uid> on|off\n/reset <uid>\n/force_link <uid>")
+
+    if cmd == "/status":
+        if len(parts) < 2:
+            usage()
+            return True
+        uid = int(parts[1])
+        u = memory.get(uid)
+        if not u:
+            send_message(chat_id, f"User {uid} not found.")
+            return True
+        send_message(chat_id, f"uid={uid}\nmessages={u['messages']}\nintent={u['intent']}\nphase={u['phase']}\nlink_stage={u['link_stage']}\ntakeover={u['takeover']}\nprofile={u['profile']}")
+        return True
+
+    if cmd == "/takeover":
+        if len(parts) < 3:
+            usage()
+            return True
+        uid = int(parts[1])
+        mode = parts[2].lower()
+        u = get_user(uid)
+        u["takeover"] = (mode == "on")
+        send_message(chat_id, f"takeover for {uid} = {u['takeover']}")
+        return True
+
+    if cmd == "/reset":
+        if len(parts) < 2:
+            usage()
+            return True
+        uid = int(parts[1])
+        memory.pop(uid, None)
+        send_message(chat_id, f"reset {uid} ok")
+        return True
+
+    if cmd == "/force_link":
+        if len(parts) < 2:
+            usage()
+            return True
+        uid = int(parts[1])
+        u = get_user(uid)
+        u["link_stage"] = 2
+        u["last_link_ts"] = time.time()
+        send_message(uid, FANVUE_LINK)
+        send_message(chat_id, f"sent link to {uid}")
+        return True
+
+    return False
+
+# ============================================================
+# 7) ONBOARDING + PROFILE EXTRACTION
+# ============================================================
+def onboarding_message() -> str:
+    return (
+        "Hey 🙂 I’m Avelyn’s assistant. I help manage her DMs so she can stay focused on training and padel.\n"
+        "What are you looking for today, a quick vibe here, private content, or a real chat with her?"
     )
 
-    # Normalize stage to known values
-    if plan.stage not in FUNNEL_STAGES:
-        plan.stage = get_stage(user_id)
+def extract_profile(u: dict, user_text: str):
+    t = user_text.strip()
 
-    return plan
+    m = re.search(r"\b(my name is|i'm|im|i am)\s+([A-Za-z]{2,20})\b", t, flags=re.IGNORECASE)
+    if m:
+        u["profile"]["name"] = m.group(2).capitalize()
 
+    m2 = re.search(r"\b(i'm from|im from|i am from|from)\s+([A-Za-z\s]{2,30})\b", t, flags=re.IGNORECASE)
+    if m2:
+        place = m2.group(2).strip()
+        if 2 <= len(place) <= 30:
+            u["profile"]["place"] = place
 
-# -----------------------------
-# Finalization / Guardrails
-# -----------------------------
-def finalize_reply(user_id: int, plan: Plan, user_text: str, rule_intent: str) -> str:
-    intent = plan.intent or rule_intent
-    stage = get_stage(user_id)
+    interests = ["gym", "padel", "football", "soccer", "boxing", "music", "travel", "cars", "crypto", "anime", "gaming"]
+    for it in interests:
+        if re.search(rf"\b{re.escape(it)}\b", t, flags=re.IGNORECASE):
+            if it not in u["profile"]["interests"]:
+                u["profile"]["interests"].append(it)
+                u["profile"]["interests"] = u["profile"]["interests"][-5:]
 
-    # Hard meetup refusal
-    if rule_intent == "MEETUP" or intent == "MEETUP":
-        return NO_MEETUPS_TEXT
+    if len(t) >= 8:
+        u["profile"]["last_topic"] = t[:90]
 
-    # Decide whether we allow Fanvue mention
-    allow_fanvue = should_mention_fanvue(user_id, rule_intent, user_text)
-    send_link = should_send_link(user_text)
+# ============================================================
+# 8) FUNNEL OVERRIDE (fast, direct, but human)
+# ============================================================
+def funnel_reply(u: dict, user_text: str):
+    t = user_text.lower().strip()
 
-    # Build base text
-    reply = strip_ai_tells(plan.reply)
+    # If user directly asks for link, give it immediately
+    if is_link_ask(t):
+        u["link_stage"] = 2
+        u["last_link_ts"] = time.time()
+        return True, f"Here you go 👀\n{FANVUE_LINK}"
 
-    # Enforce: no link unless explicitly requested
-    reply = re.sub(r"https?://\S+", "", reply).strip()
+    # If user asks about spicy/photos, keep it classy and redirect
+    if any(k in t for k in ["spicy", "nudes", "nsfw", "explicit", "send a photo", "send a pic", "pic", "pics", "selfie"]):
+        u["link_stage"] = max(u["link_stage"], 1)
+        msg = (
+            "I can’t do explicit stuff here, and we don’t send private pics on Telegram.\n"
+            "If you want the private side and customs, Fanvue is where Avelyn keeps it."
+        )
+        # offer link without robotic confirmation
+        msg2 = "Want the link now or do you want me to tell you what you get first?"
+        return True, f"{msg}\n{msg2}"
 
-    # Optionally add follow-up question (one)
-    followup = strip_ai_tells(plan.followup or "").strip()
-    if plan.ask_followup and followup:
-        # Ensure it is a question, short
-        if len(followup) > 90:
-            followup = followup[:90].rsplit(" ", 1)[0] + "?"
-        if not followup.endswith("?"):
-            followup = followup.rstrip(".") + "?"
-    else:
-        followup = ""
+    # If user is clearly buyer intent, offer link or contents
+    if u["intent"] == "buyer_intent":
+        u["link_stage"] = max(u["link_stage"], 1)
+        return True, (
+            "If you want the full private side, Fanvue is the place.\n"
+            "Do you want the link right away, or a quick rundown of what’s inside?"
+        )
 
-    # Keep it short (max ~4 lines)
-    parts = []
-    if reply:
-        parts.append(reply)
+    return False, None
 
-    if followup:
-        parts.append(followup)
+# ============================================================
+# 9) RE ENGAGEMENT (cron)
+# ============================================================
+def eligible_for_reengage(u: dict) -> bool:
+    now_ts = time.time()
+    last_seen = u.get("last_seen_ts", now_ts)
+    last_ping = u.get("last_reengage_ts", 0.0)
+    inactive_hours = (now_ts - last_seen) / 3600.0
+    since_last = (now_ts - last_ping) / 3600.0
+    return inactive_hours >= REENGAGE_COOLDOWN_HOURS and since_last >= REENGAGE_COOLDOWN_HOURS
 
-    text = "\n".join([p for p in parts if p]).strip()
+def build_reengage_message(u: dict) -> str:
+    name = (u.get("profile", {}) or {}).get("name", "").strip()
+    if name:
+        return f"hey {name} 🙂 you went quiet on me. you good?"
+    return "hey 🙂 you went quiet on me. you good?"
 
-    # If the model tried to push Fanvue but it's not allowed, remove references
-    if not allow_fanvue:
-        if "fanvue" in text.lower():
-            text = re.sub(r"(?i)\bfanvue\b", "", text).strip()
-            text = normalize_text(text)
-            if not text:
-                text = "Snap ik. Waar ben je precies benieuwd naar?"
+@app.route("/cron", methods=["GET"])
+def cron():
+    if CRON_SECRET:
+        token = request.args.get("token", "")
+        if token != CRON_SECRET:
+            abort(403)
 
-    # If Fanvue mention is allowed, keep it natural and only once
-    if allow_fanvue:
-        # If user asked about 1-on-1/customs/fanvue, we allow 1 mention.
-        # If reply doesn't mention it but it would help, add a soft line depending on intent/stage.
-        if "fanvue" not in text.lower() and rule_intent in {"PRIVATE_CHAT", "CUSTOMS", "FANVUE_INFO"}:
-            # Soft, no hype
-            add = "Als je 1-op-1 wil of iets persoonlijks, dan kan dat het makkelijkst via Fanvue."
-            # Keep within 4 lines
-            if text:
-                text = f"{text}\n{add}"
-            else:
-                text = add
+    sent = 0
+    for uid, u in list(memory.items()):
+        if u.get("takeover"):
+            continue
+        if eligible_for_reengage(u):
+            send_message(uid, build_reengage_message(u))
+            u["last_reengage_ts"] = time.time()
+            sent += 1
+            if sent >= 20:
+                break
 
-        # Ensure only one 'Fanvue' word appears
-        # If it appears multiple times, collapse to first
-        occurrences = len(re.findall(r"(?i)\bfanvue\b", text))
-        if occurrences > 1:
-            # Remove all but first
-            first = re.search(r"(?i)\bfanvue\b", text)
-            if first:
-                before = text[: first.end()]
-                after = re.sub(r"(?i)\bfanvue\b", "", text[first.end():])
-                text = (before + after).strip()
-                text = normalize_text(text)
+    return {"ok": True, "sent": sent}
 
-    # Add link only if explicitly requested
-    if send_link:
-        # Avoid sales pitch, just comply
-        if text:
-            text = f"{text}\n{FANVUE_LINK}".strip()
-        else:
-            text = f"Tuurlijk.\n{FANVUE_LINK}".strip()
+# ============================================================
+# 10) GPT RESPONSE (Assistant identity, English only, reacts to user)
+# ============================================================
+def build_system_prompt(u: dict) -> str:
+    variant_line = (
+        "Variant A: slightly more playful and teasing, but still respectful."
+        if u["variant"] == "A"
+        else "Variant B: softer, reassuring, friendly."
+    )
 
-    # Human micro-variation + anti repetition
-    text = add_human_micro_variation(text)
+    p = u.get("profile", {})
+    mem_bits = []
+    if p.get("name"):
+        mem_bits.append(f"Name: {p['name']}")
+    if p.get("place"):
+        mem_bits.append(f"Place: {p['place']}")
+    if p.get("interests"):
+        mem_bits.append(f"Interests: {', '.join(p['interests'][-3:])}")
+    memory_line = " | ".join(mem_bits) if mem_bits else "No saved details yet."
 
-    # If too repetitive, force a different line
-    if is_repetitive(user_id, text):
-        text = "Snap ik. Wat zoek je vooral, chat of iets specifieks?"
+    return f"""
+You are Avelyn Noira's assistant, managing her Telegram DMs.
+You are NOT Avelyn. You speak as an assistant, but still warm and human.
 
-    # Final cleanup: no em-dash, no bullets
-    text = strip_ai_tells(text)
+LANGUAGE:
+Only write in English.
 
-    # Prevent super long messages
-    text = text.strip()
-    if len(text) > 500:
-        text = text[:500].rsplit(" ", 1)[0].strip()
+STYLE:
+Keep it short and human, 1 to 2 sentences usually.
+No lists. No bullet points.
+Do not use dash separators. Avoid hyphen bullets and avoid em dash.
+Do not sound like an AI assistant. No lectures. No generic platform talk.
+Before answering, mirror one small detail from the user's last message (3 to 8 words) so it feels understood.
 
-    return text
+TRUTHFULNESS:
+Say Avelyn checks in and reads highlighted messages when she can.
+Do not claim she is watching live.
+No meetups. No explicit content.
 
+GOAL:
+Your job is to respond naturally to what the user says and gently guide them to Fanvue when relevant.
+If they ask what’s inside Fanvue, explain benefits clearly: private drops, customs, and direct replies from Avelyn.
+If they ask for the link, give it.
+If they want spicy content, keep it classy and redirect to Fanvue without explicit detail.
 
-# -----------------------------
-# Webhook
-# -----------------------------
+BIO CONTEXT (use only if asked about her story, scar, origin, background):
+{AVELYN_BIO}
+
+USER CONTEXT:
+Intent: {u.get("intent")}
+Phase: {u.get("phase")}
+Micro memory: {memory_line}
+{variant_line}
+
+Write the next message now.
+""".strip()
+
+def gpt_reply(u: dict) -> str:
+    system_prompt = build_system_prompt(u)
+    resp = client.responses.create(
+        model=MODEL,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+        input=[{"role": "system", "content": system_prompt}, *u["history"]],
+    )
+    reply = (resp.output_text or "").strip()
+    reply = maybe_shorten(reply)
+    reply = maybe_typo_curated(reply)
+    reply = sanitize_reply(reply)
+    return reply
+
+# ============================================================
+# 11) WEBHOOK
+# ============================================================
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    update = request.get_json(force=True) or {}
-    message = update.get("message") or update.get("edited_message")
-    if not message:
-        return jsonify({"ok": True})
+    cleanup_processed()
 
-    chat_id = message["chat"]["id"]
-    user_id = message["from"]["id"]
-    text = message.get("text", "")
+    update = request.get_json(silent=True) or {}
+
+    # handle only standard messages
+    msg = update.get("message")
+    if not msg:
+        return "ok"
+
+    chat_id = msg["chat"]["id"]
+    text = (msg.get("text") or "").strip()
+    uid = msg.get("from", {}).get("id", chat_id)
+
+    # Ignore all slash commands for normal users (prevents /start replies)
+    if text.startswith("/"):
+        # allow admin commands only in admin chat
+        if handle_admin_command(text, chat_id):
+            return "ok"
+        return "ok"
+
+    # De dup key using update_id + message_id (more robust on retries)
+    update_id = update.get("update_id")
+    message_id = msg.get("message_id")
+    dedup_key = f"{uid}:{update_id}:{message_id}"
+    if dedup_key in processed:
+        return "ok"
+    processed[dedup_key] = time.time()
+
     if not text:
-        return jsonify({"ok": True})
+        return "ok"
 
-    user_text = text.strip()
+    u = get_user(uid)
 
-    # 1) Rule-based intent
-    rule_intent = detect_intent_rulebased(user_text)
+    # takeover: silent for this user
+    if u.get("takeover"):
+        return "ok"
 
-    # 2) Update funnel stage from the new signal BEFORE planning
-    update_stage_from_signal(user_id, rule_intent, user_text)
+    # rate limit
+    if not allow_rate(u):
+        return "ok"
 
-    # 3) Store user message in history
-    history[user_id].append({"role": "user", "content": user_text})
+    # Update basics
+    u["messages"] += 1
+    u["intent"] = detect_intent(text)
+    u["last_seen_ts"] = time.time()
 
-    # 4) Get plan from model (JSON)
-    try:
-        plan = openai_plan(user_id, rule_intent, user_text)
-    except Exception:
-        reply = "Oeps, ik liep even vast. Stuur je vraag nog een keer kort?"
-        tg_send_message(chat_id, reply, reply_to_message_id=message.get("message_id"))
-        return jsonify({"ok": True})
+    # Phase logic (simple)
+    if u["messages"] < 4:
+        u["phase"] = 1
+    elif u["intent"] == "buyer_intent":
+        u["phase"] = 3
+    else:
+        u["phase"] = 2
 
-    # 5) Apply plan stage update (model suggestion), but never downgrade
-    if plan.stage in FUNNEL_STAGES:
-        bump_stage(user_id, plan.stage)
+    u["priority"] = (u["intent"] == "buyer_intent") or (u["messages"] >= 12)
 
-    # 6) Finalize reply with guardrails
-    reply = finalize_reply(user_id, plan, user_text, rule_intent)
+    extract_profile(u, text)
 
-    # 7) Store assistant reply in history
-    history[user_id].append({"role": "assistant", "content": reply})
+    # Save history user turn
+    u["history"].append({"role": "user", "content": text})
+    u["history"] = u["history"][-HISTORY_TURNS:]
 
-    tg_send_message(chat_id, reply, reply_to_message_id=message.get("message_id"))
-    return jsonify({"ok": True})
+    # Onboarding on very first message
+    if u["messages"] == 1:
+        reply = sanitize_reply(onboarding_message())
+        d = human_delay("casual", 1, False)
+        wait_human(chat_id, d)
+        send_message(chat_id, reply)
+        u["history"].append({"role": "assistant", "content": reply})
+        u["history"] = u["history"][-HISTORY_TURNS:]
+        return "ok"
 
+    # FAQ fast answers for non link items (still human)
+    faq = match_faq(text)
+    if faq in FAQ_REPLIES and faq != "link":
+        reply = FAQ_REPLIES[faq]
+        reply = sanitize_reply(reply)
+        d = human_delay(u["intent"], u["phase"], u["priority"])
+        wait_human(chat_id, d)
+        if random.random() < 0.10:
+            reply = sanitize_reply(f"{pre_filler()} {reply}")
+        send_message(chat_id, reply)
+        u["history"].append({"role": "assistant", "content": reply})
+        u["history"] = u["history"][-HISTORY_TURNS:]
+        return "ok"
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
+    # Funnel override (fast direct but not robotic)
+    handled, reply = funnel_reply(u, text)
+    if handled and reply:
+        # admin alert only to admin chat id, never to user
+        if u["intent"] == "buyer_intent" and should_alert(u):
+            mark_alert(u)
+            label = u.get("profile", {}).get("name") or f"uid:{uid}"
+            notify_admin(f"Hot intent ({label}) asked about Fanvue or private content. link_stage={u['link_stage']}")
 
+        reply = sanitize_reply(reply)
+        d = human_delay(u["intent"], u["phase"], u["priority"])
+        wait_human(chat_id, d)
+        if random.random() < 0.10:
+            reply = sanitize_reply(f"{pre_filler()} {reply}")
+        send_message(chat_id, reply)
+        u["history"].append({"role": "assistant", "content": reply})
+        u["history"] = u["history"][-HISTORY_TURNS:]
+        return "ok"
 
+    # GPT normal response
+    reply = gpt_reply(u)
+
+    d = human_delay(u["intent"], u["phase"], u["priority"])
+    wait_human(chat_id, d)
+    if random.random() < 0.10:
+        reply = sanitize_reply(f"{pre_filler()} {reply}")
+
+    send_message(chat_id, reply)
+
+    # Save assistant turn
+    u["history"].append({"role": "assistant", "content": reply})
+    u["history"] = u["history"][-HISTORY_TURNS:]
+
+    return "ok"
+
+# ============================================================
+# 12) RENDER BINDING
+# ============================================================
 if __name__ == "__main__":
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
-    if not OPENAI_API_KEY:
-        raise RuntimeError("Missing OPENAI_API_KEY env var")
-
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
