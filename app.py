@@ -29,11 +29,11 @@ MAX_OUTPUT_TOKENS = 190
 PROCESSED_TTL_SECONDS = 60 * 10
 MAX_MSGS_PER_MINUTE = 7
 
-# Admin alerts and daily reengage
+# Admin alerts + re-engage
 ALERT_COOLDOWN_MINUTES = 25
 REENGAGE_COOLDOWN_HOURS = 24
 
-# Follow-ups (requires /cron)
+# Follow-ups (requires /cron pinging)
 FOLLOWUP_1_MINUTES = int(os.environ.get("FOLLOWUP_1_MINUTES", "35"))
 FOLLOWUP_2_MINUTES = int(os.environ.get("FOLLOWUP_2_MINUTES", "150"))
 FOLLOWUP_3_MINUTES = int(os.environ.get("FOLLOWUP_3_MINUTES", "480"))
@@ -75,30 +75,26 @@ The scar is visible. It does not ask for sympathy. It is simply part of her stor
 FOUNDERS_PROMO_ACTIVE = os.environ.get("FOUNDERS_PROMO_ACTIVE", "1") == "1"
 FOUNDERS_PROMO_PERCENT = int(os.environ.get("FOUNDERS_PROMO_PERCENT", "50"))
 FOUNDERS_PROMO_LIMIT = int(os.environ.get("FOUNDERS_PROMO_LIMIT", "50"))
+PROMO_MENTION_COOLDOWN_HOURS = int(os.environ.get("PROMO_MENTION_COOLDOWN_HOURS", "24"))
 
 def founders_promo_line() -> str:
     if not FOUNDERS_PROMO_ACTIVE:
         return ""
     return (
-        f"And just so you know, we have a founders deal right now. "
+        f"Just so you know, we have a founders deal right now. "
         f"First {FOUNDERS_PROMO_LIMIT} members get {FOUNDERS_PROMO_PERCENT} percent off, then it locks."
     )
 
 def founders_bonus_line() -> str:
     if not FOUNDERS_PROMO_ACTIVE:
         return ""
-    return (
-        "Also, the first 50 get an exclusive bonus drop at signup that nobody else will get later."
-    )
-
-# Mention control so it’s not spammy
-PROMO_MENTION_COOLDOWN_HOURS = int(os.environ.get("PROMO_MENTION_COOLDOWN_HOURS", "24"))
+    return "Also, the first 50 get an exclusive bonus drop at signup that nobody else will get later."
 
 # ============================================================
-# 1) IN MEMORY STATE (Render restart resets)
+# 1) IN-MEMORY STATE (Render restart resets)
 # ============================================================
 memory = {}      # uid -> user_state dict
-processed = {}   # key -> ts  (dedup store)
+processed = {}   # dedup_key -> ts
 
 AB_VARIANTS = ["A", "B"]
 
@@ -117,12 +113,19 @@ def send_message(chat_id: int, text: str):
 def send_typing(chat_id: int):
     tg_post("sendChatAction", {"chat_id": chat_id, "action": "typing"})
 
-def notify_admin(text: str):
-    if ADMIN_CHAT_ID and int(ADMIN_CHAT_ID) != 0:
-        send_message(ADMIN_CHAT_ID, f"[ALERT] {text}")
+def notify_admin(text: str, current_uid: int | None = None):
+    """
+    Important: never send admin alerts to the same uid that is chatting.
+    This avoids the common misconfig where ADMIN_CHAT_ID accidentally equals a test user id.
+    """
+    if not ADMIN_CHAT_ID or int(ADMIN_CHAT_ID) == 0:
+        return
+    if current_uid is not None and int(ADMIN_CHAT_ID) == int(current_uid):
+        return
+    send_message(ADMIN_CHAT_ID, f"[ALERT] {text}")
 
 # ============================================================
-# 3) HOUSEKEEPING: DE DUP + RATE LIMIT
+# 3) HOUSEKEEPING: DE-DUP + RATE LIMIT
 # ============================================================
 def cleanup_processed():
     now = time.time()
@@ -204,15 +207,28 @@ def maybe_typo_curated(text: str) -> str:
     return out
 
 def sanitize_reply(text: str) -> str:
+    """
+    Requirements:
+    English only is enforced by prompt, but we still sanitize formatting.
+    Remove bullet/list vibe and dash separators.
+    """
     if not text:
         return ""
     t = text.strip()
+
+    # Remove bullets
     t = re.sub(r"(?m)^\s*[-•]\s*", "", t)
+
+    # Avoid dash separators and em dashes
     t = t.replace("—", ", ")
     t = t.replace(" - ", " ")
-    t = t.replace("\n-\n", "\n")
+
+    # Remove standalone dash lines
     t = re.sub(r"(?m)^\s*-\s*$", "", t)
+
+    # Normalize newlines
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
+
     return t
 
 # ============================================================
@@ -227,6 +243,7 @@ FAQ_MAP = {
     "bio": ["where are you from", "chengdu", "scar", "your eye", "your story", "who are you", "tell me about you", "background"],
     "promo": ["discount", "deal", "founder", "founders", "50%", "half off", "offer", "bonus", "exclusive content"],
 }
+
 FAQ_REPLIES = {
     "price": "It’s the normal sub price on the page, you’ll see it before you confirm anything.",
     "safe": "Yep, it’s official and you stay inside the platform. You can cancel anytime.",
@@ -277,6 +294,7 @@ def update_hesitation(u: dict, user_text: str):
         inc += 1
     if "scam" in t or "legit" in t:
         inc += 1
+
     if inc > 0:
         u["hesitation_score"] = min(20, u.get("hesitation_score", 0) + inc)
     else:
@@ -292,7 +310,7 @@ def mark_promo_mentioned(u: dict):
     u["last_promo_mention_ts"] = time.time()
 
 # ============================================================
-# 6) FUNNEL STATE + ADMIN
+# 6) USER STATE + ADMIN
 # ============================================================
 def should_alert(u: dict) -> bool:
     return (time.time() - u.get("last_alert_ts", 0.0)) > (ALERT_COOLDOWN_MINUTES * 60)
@@ -309,28 +327,34 @@ def get_user(uid: int):
             "intent": "casual",
             "priority": False,
 
+            # funnel
             "link_stage": 0,      # 0 none, 1 offered, 2 sent
             "last_link_ts": 0.0,
 
+            # admin
             "takeover": False,
             "last_alert_ts": 0.0,
 
+            # convo
             "history": [],
             "rate_window": [],
             "variant": random.choice(AB_VARIANTS),
 
+            # micro memory
             "profile": {"name": "", "place": "", "interests": [], "last_topic": ""},
 
+            # persuasion signals
             "hesitation_score": 0,
+            "last_promo_mention_ts": 0.0,
 
+            # timing
             "last_seen_ts": now,
             "last_reengage_ts": 0.0,
-
             "last_bot_ts": 0.0,
+
+            # follow-ups per day
             "followups_sent_today": 0,
             "followup_day_key": time.strftime("%Y%m%d", time.gmtime(now)),
-
-            "last_promo_mention_ts": 0.0,
         }
     return memory[uid]
 
@@ -399,13 +423,10 @@ def handle_admin_command(text: str, chat_id: int):
 # 7) ONBOARDING + PROFILE EXTRACTION
 # ============================================================
 def onboarding_message(u: dict) -> str:
-    base = (
+    return (
         "Hey 🙂 I’m Avelyn’s assistant. I help manage her DMs so she can stay focused on training and padel.\n"
         "What are you looking for today, private content, customs, or a real chat with her?"
     )
-    # Keep promo out of the very first message to avoid being too salesy.
-    # We mention it later when relevant or when asked.
-    return base
 
 def extract_profile(u: dict, user_text: str):
     t = user_text.strip()
@@ -431,13 +452,13 @@ def extract_profile(u: dict, user_text: str):
         u["profile"]["last_topic"] = t[:90]
 
 # ============================================================
-# 8) FUNNEL OVERRIDE (direct but human) + PROMO WHEN ASKED OR FITS
+# 8) FUNNEL OVERRIDE (direct but human) + PROMO WHEN ASKED / FITS
 # ============================================================
 def funnel_reply(u: dict, user_text: str):
     t = user_text.lower().strip()
     faq = match_faq(t)
 
-    # If user asks about promo/discount/bonus, answer it directly
+    # Promo questions
     if faq == "promo":
         msg = founders_promo_line()
         bonus = founders_bonus_line()
@@ -450,15 +471,13 @@ def funnel_reply(u: dict, user_text: str):
         u["link_stage"] = 2
         u["last_link_ts"] = time.time()
         msg = f"Here you go 👀\n{FANVUE_LINK}"
-        # When they are already asking, it’s safe to add a light extra
         if can_mention_promo(u) and FOUNDERS_PROMO_ACTIVE:
             mark_promo_mentioned(u)
-            msg = msg + "\n" + founders_promo_line()
-            msg = msg + "\n" + founders_bonus_line()
+            msg = msg + "\n" + founders_promo_line() + "\n" + founders_bonus_line()
         return True, msg
 
-    # Spicy or photos
-    if any(k in t for k in ["spicy", "nudes", "nsfw", "explicit", "send a photo", "send a pic", "pic", "pics", "selfie"]):
+    # Explicit asks or photo demands get redirected
+    if any(k in t for k in ["spicy", "nudes", "nsfw", "explicit", "sex", "porn", "send a photo", "send a pic", "pics", "selfie"]):
         u["link_stage"] = max(u["link_stage"], 1)
         msg = (
             "I can’t do explicit stuff here, and we don’t send private pics on Telegram.\n"
@@ -467,8 +486,7 @@ def funnel_reply(u: dict, user_text: str):
         if can_mention_promo(u) and FOUNDERS_PROMO_ACTIVE:
             mark_promo_mentioned(u)
             msg = msg + "\n" + founders_promo_line()
-        msg2 = "Want the link now, or do you want a quick rundown first?"
-        return True, f"{msg}\n{msg2}"
+        return True, msg + "\nWant the link now, or do you want a quick rundown first?"
 
     # Buyer intent
     if u["intent"] == "buyer_intent":
@@ -477,26 +495,24 @@ def funnel_reply(u: dict, user_text: str):
             "If you want the full private side, Fanvue is the place.\n"
             "Do you want the link right away, or do you want me to explain what you get?"
         )
-        # If they’re hesitating or asking price stuff, mention promo softly
         if (u.get("hesitation_score", 0) >= 4) and can_mention_promo(u) and FOUNDERS_PROMO_ACTIVE:
             mark_promo_mentioned(u)
             msg = msg + "\n" + founders_promo_line()
         return True, msg
 
-    # Hesitation with link already in topic
+    # Hesitation nudges
     if u.get("hesitation_score", 0) >= 6 and u.get("link_stage", 0) >= 1:
         msg = "I get it, you don’t want to waste money. What’s the main thing holding you back, price or trust?"
-        if can_mention_promo(u) and FOUNDERS_PROMO_ACTIVE:
+        if can_mention_promo(u) and FOUNDERS_PROMO_ACTIVE and can_mention_promo(u):
             mark_promo_mentioned(u)
-            msg = msg + "\n" + founders_promo_line()
-            msg = msg + "\n" + founders_bonus_line()
+            msg = msg + "\n" + founders_promo_line() + "\n" + founders_bonus_line()
         return True, msg
 
     return False, None
 
 # ============================================================
-# 9) FOLLOW UPS + RE ENGAGEMENT (requires cron)
-# Follow-ups continue until the Fanvue link has been sent (link_stage == 2)
+# 9) FOLLOW-UPS + RE-ENGAGE (requires /cron pinging)
+# Follow-ups keep contact until link_stage == 2
 # ============================================================
 def day_key_now() -> str:
     return time.strftime("%Y%m%d", time.gmtime(time.time()))
@@ -524,10 +540,8 @@ def build_reengage_message(u: dict) -> str:
 def eligible_for_followup(u: dict):
     reset_daily_followups(u)
 
-    # Stop follow-ups once the link is already sent
     if u.get("link_stage", 0) == 2:
         return None
-
     if u.get("takeover"):
         return None
     if u.get("followups_sent_today", 0) >= FOLLOWUP_MAX_PER_DAY:
@@ -535,17 +549,17 @@ def eligible_for_followup(u: dict):
 
     last_seen = u.get("last_seen_ts", 0.0)
     last_bot = u.get("last_bot_ts", 0.0)
+
+    # Only follow up if bot spoke last and user didn’t respond after that
     if last_bot <= 0.0:
         return None
-
-    # user replied after bot spoke
     if last_seen > last_bot:
         return None
 
     now_ts = time.time()
     minutes_since_bot = (now_ts - last_bot) / 60.0
-
     count = u.get("followups_sent_today", 0)
+
     if count == 0 and minutes_since_bot >= FOLLOWUP_1_MINUTES:
         return 1
     if count == 1 and minutes_since_bot >= FOLLOWUP_2_MINUTES:
@@ -559,25 +573,21 @@ def build_followup_message(u: dict, stage: int) -> str:
     name = (u.get("profile", {}) or {}).get("name", "").strip()
     intro = f"hey {name} 🙂 " if name else "hey 🙂 "
 
-    # Keep it human and progress toward link without sounding robotic
+    # Keep it human, reference what they want, and progress toward link without robotic confirmations.
     if stage == 1:
         if u.get("link_stage", 0) >= 1:
-            msg = intro + "quick check, were you still curious about Fanvue, or were you looking for something specific?"
-        else:
-            msg = intro + "what were you looking for today, private content or a real chat with Avelyn?"
-        return msg
+            return intro + "quick check, were you still curious about Fanvue, or were you looking for something specific?"
+        return intro + "what were you looking for today, private content or a real chat with Avelyn?"
 
     if stage == 2:
         msg = intro + "no pressure, but if you tell me what you want, I’ll point you the right way."
-        # Soft promo mention only if it fits and cooldown allows
-        if can_mention_promo(u) and FOUNDERS_PROMO_ACTIVE and u.get("hesitation_score", 0) >= 3:
+        if FOUNDERS_PROMO_ACTIVE and u.get("hesitation_score", 0) >= 3 and can_mention_promo(u):
             mark_promo_mentioned(u)
             msg = msg + " " + founders_promo_line()
         return msg
 
-    # stage 3
     msg = intro + "if you want, I can just drop the Fanvue link and you can take a look in 10 seconds."
-    if can_mention_promo(u) and FOUNDERS_PROMO_ACTIVE:
+    if FOUNDERS_PROMO_ACTIVE and can_mention_promo(u):
         mark_promo_mentioned(u)
         msg = msg + " " + founders_bonus_line()
     return msg
@@ -615,7 +625,7 @@ def cron():
     return {"ok": True, "sent": sent}
 
 # ============================================================
-# 10) GPT RESPONSE (empathy + assistant identity + promo mention only when asked)
+# 10) GPT RESPONSE (assistant identity, empathy, reacts to user)
 # ============================================================
 def build_system_prompt(u: dict) -> str:
     variant_line = (
@@ -654,20 +664,22 @@ Keep it short, 1 to 2 sentences usually.
 No lists. No bullets. Do not use dash separators or em dashes.
 Do not sound like an AI assistant. No lectures. No generic platform talk.
 
-EMPATHY:
-React to what the user actually said with one validating line.
-Then ask one simple question to move the conversation forward.
+ASSISTANT IDENTITY:
+In the first 2 messages with a new user, make it clear you manage DMs and Avelyn checks in when she can.
+Say she reads highlighted messages when possible, but do not claim she is watching live.
 
-TRUTHFULNESS:
-Say Avelyn checks in and reads highlighted messages when she can.
-Do not claim she is watching live.
-No meetups. No explicit content.
+EMPATHY:
+Respond directly to what the user said, then ask one simple question to move the chat forward.
+
+SAFETY:
+No meetups.
+No explicit content.
 
 GOAL:
-Respond naturally and guide them to Fanvue when relevant.
+Help users understand what Telegram is for and what Fanvue unlocks.
 If they ask what’s inside Fanvue, explain benefits clearly: private drops, customs, and real replies from Avelyn.
-If they ask for the link, give it.
-If they want spicy content, keep it classy and redirect to Fanvue without explicit details.
+If they ask for the link, give it immediately.
+If they ask for explicit content, keep it classy and redirect to Fanvue without explicit detail.
 
 PROMO:
 {promo_context}
@@ -698,11 +710,14 @@ def gpt_reply(u: dict) -> str:
     reply = sanitize_reply(reply)
     return reply
 
-#==========================================
-# 10) ALIVE
+# ============================================================
+# 10.5) HEALTH (for keep-alive monitor)
+# ============================================================
 @app.route("/", methods=["GET"])
-def home():
-    return {"status": "alive"}, 200
+@app.route("/health", methods=["GET"])
+def health():
+    return {"ok": True}, 200
+
 # ============================================================
 # 11) WEBHOOK
 # ============================================================
@@ -716,16 +731,20 @@ def webhook():
         return "ok"
 
     chat_id = msg["chat"]["id"]
-    text = (msg.get("text") or "").strip()
     uid = msg.get("from", {}).get("id", chat_id)
 
-    # Ignore all slash commands for normal users
+    # Only text for now
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return "ok"
+
+    # Ignore slash commands for normal users
     if text.startswith("/"):
         if handle_admin_command(text, chat_id):
             return "ok"
         return "ok"
 
-    # De dup key using update_id + message_id
+    # De-dup key using update_id + message_id
     update_id = update.get("update_id")
     message_id = msg.get("message_id")
     dedup_key = f"{uid}:{update_id}:{message_id}"
@@ -733,21 +752,22 @@ def webhook():
         return "ok"
     processed[dedup_key] = time.time()
 
-    if not text:
-        return "ok"
-
     u = get_user(uid)
 
+    # takeover: silent for this user
     if u.get("takeover"):
         return "ok"
 
+    # rate limit
     if not allow_rate(u):
         return "ok"
 
+    # update basics
     u["messages"] += 1
     u["intent"] = detect_intent(text)
     u["last_seen_ts"] = time.time()
 
+    # phase logic
     if u["messages"] < 4:
         u["phase"] = 1
     elif u["intent"] == "buyer_intent":
@@ -760,9 +780,11 @@ def webhook():
     extract_profile(u, text)
     update_hesitation(u, text)
 
+    # save history user turn
     u["history"].append({"role": "user", "content": text})
     u["history"] = u["history"][-HISTORY_TURNS:]
 
+    # onboarding
     if u["messages"] == 1:
         reply = sanitize_reply(onboarding_message(u))
         d = human_delay("casual", 1, False)
@@ -773,8 +795,9 @@ def webhook():
         u["history"] = u["history"][-HISTORY_TURNS:]
         return "ok"
 
+    # FAQ fast answers (non-link, non-promo handled in funnel)
     faq = match_faq(text)
-    if faq in FAQ_REPLIES and faq != "link" and faq != "promo":
+    if faq in FAQ_REPLIES and faq not in ["link", "promo"]:
         reply = sanitize_reply(FAQ_REPLIES[faq])
         d = human_delay(u["intent"], u["phase"], u["priority"])
         wait_human(chat_id, d)
@@ -786,13 +809,15 @@ def webhook():
         u["history"] = u["history"][-HISTORY_TURNS:]
         return "ok"
 
+    # funnel override
     handled, reply = funnel_reply(u, text)
     if handled and reply:
         if u["intent"] == "buyer_intent" and should_alert(u):
             mark_alert(u)
             label = u.get("profile", {}).get("name") or f"uid:{uid}"
             notify_admin(
-                f"Hot intent ({label}) asked about Fanvue or promo. link_stage={u['link_stage']} hesitation={u.get('hesitation_score', 0)}"
+                f"Hot intent ({label}) asked about Fanvue or promo. link_stage={u['link_stage']} hesitation={u.get('hesitation_score', 0)}",
+                current_uid=uid
             )
 
         reply = sanitize_reply(reply)
@@ -806,14 +831,14 @@ def webhook():
         u["history"] = u["history"][-HISTORY_TURNS:]
         return "ok"
 
+    # GPT response
     reply = gpt_reply(u)
-
     d = human_delay(u["intent"], u["phase"], u["priority"])
     wait_human(chat_id, d)
     if random.random() < 0.10:
         reply = sanitize_reply(f"{pre_filler()} {reply}")
-
     send_message(chat_id, reply)
+
     u["last_bot_ts"] = time.time()
     u["history"].append({"role": "assistant", "content": reply})
     u["history"] = u["history"][-HISTORY_TURNS:]
