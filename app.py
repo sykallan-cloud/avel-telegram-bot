@@ -6,6 +6,11 @@ import requests
 from flask import Flask, request, abort
 from openai import OpenAI
 
+import json
+import gspread
+from google.oauth2.service_account import Credentials
+from typing import Optional
+
 app = Flask(__name__)
 
 # ============================================================
@@ -91,6 +96,51 @@ def founders_bonus_line() -> str:
     return "Also, the first 50 get an exclusive bonus drop at signup that nobody else will get later."
 
 # ============================================================
+# 0.3) GOOGLE SHEETS DASHBOARD (optional)
+# ============================================================
+SHEET_LOGGING_ENABLED = os.environ.get("SHEET_LOGGING_ENABLED", "1") == "1"
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+
+sheet = None
+if SHEET_LOGGING_ENABLED and GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_SHEET_ID:
+    try:
+        creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        # Render env often escapes newlines in the private key
+        if "private_key" in creds_dict:
+            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
+
+        # Ensure header row exists
+        if sheet.row_values(1) == []:
+            sheet.append_row([
+                "ts_utc",
+                "event",
+                "uid",
+                "name",
+                "intent",
+                "phase",
+                "link_stage",
+                "hesitation_score",
+                "messages",
+                "followups_today",
+                "last_seen_utc",
+                "text_preview",
+                "status",
+            ], value_input_option="USER_ENTERED")
+        print("✅ Google Sheet connected")
+    except Exception as e:
+        sheet = None
+        print("❌ Google Sheet connect failed:", e)
+
+# ============================================================
 # 1) IN-MEMORY STATE (Render restart resets)
 # ============================================================
 memory = {}      # uid -> user_state dict
@@ -113,7 +163,7 @@ def send_message(chat_id: int, text: str):
 def send_typing(chat_id: int):
     tg_post("sendChatAction", {"chat_id": chat_id, "action": "typing"})
 
-def notify_admin(text: str, current_uid: int | None = None):
+def notify_admin(text: str, current_uid: Optional[int] = None):
     """
     Important: never send admin alerts to the same uid that is chatting.
     This avoids the common misconfig where ADMIN_CHAT_ID accidentally equals a test user id.
@@ -123,6 +173,52 @@ def notify_admin(text: str, current_uid: int | None = None):
     if current_uid is not None and int(ADMIN_CHAT_ID) == int(current_uid):
         return
     send_message(ADMIN_CHAT_ID, f"[ALERT] {text}")
+
+# ============================================================
+# 2.5) SHEET LOGGING HELPERS
+# ============================================================
+def _utc_ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time()))
+
+def calculate_status(u: dict) -> str:
+    if u.get("link_stage", 0) == 2:
+        return "LinkSent"
+    if u.get("intent") == "buyer_intent":
+        return "Hot"
+    if u.get("hesitation_score", 0) >= 4:
+        return "Warm"
+    return "Cold"
+
+def sheet_log(event: str, uid: int, u: dict, text_preview: str = ""):
+    if not sheet:
+        return
+    try:
+        p = u.get("profile", {}) or {}
+        name = p.get("name", "")
+        last_seen = u.get("last_seen_ts", 0.0)
+        last_seen_utc = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(last_seen)) if last_seen else ""
+        preview = (text_preview or "").strip().replace("\n", " ")
+        if len(preview) > 140:
+            preview = preview[:140] + "…"
+
+        row = [
+            _utc_ts(),
+            event,
+            uid,
+            name,
+            u.get("intent", ""),
+            u.get("phase", ""),
+            u.get("link_stage", ""),
+            u.get("hesitation_score", ""),
+            u.get("messages", ""),
+            u.get("followups_sent_today", ""),
+            last_seen_utc,
+            preview,
+            calculate_status(u),
+        ]
+        sheet.append_row(row, value_input_option="USER_ENTERED")
+    except Exception as e:
+        print("❌ Sheet logging error:", e)
 
 # ============================================================
 # 3) HOUSEKEEPING: DE-DUP + RATE LIMIT
@@ -208,27 +304,16 @@ def maybe_typo_curated(text: str) -> str:
 
 def sanitize_reply(text: str) -> str:
     """
-    Requirements:
-    English only is enforced by prompt, but we still sanitize formatting.
     Remove bullet/list vibe and dash separators.
     """
     if not text:
         return ""
     t = text.strip()
-
-    # Remove bullets
     t = re.sub(r"(?m)^\s*[-•]\s*", "", t)
-
-    # Avoid dash separators and em dashes
     t = t.replace("—", ", ")
     t = t.replace(" - ", " ")
-
-    # Remove standalone dash lines
     t = re.sub(r"(?m)^\s*-\s*$", "", t)
-
-    # Normalize newlines
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
-
     return t
 
 # ============================================================
@@ -503,7 +588,7 @@ def funnel_reply(u: dict, user_text: str):
     # Hesitation nudges
     if u.get("hesitation_score", 0) >= 6 and u.get("link_stage", 0) >= 1:
         msg = "I get it, you don’t want to waste money. What’s the main thing holding you back, price or trust?"
-        if can_mention_promo(u) and FOUNDERS_PROMO_ACTIVE and can_mention_promo(u):
+        if can_mention_promo(u) and FOUNDERS_PROMO_ACTIVE:
             mark_promo_mentioned(u)
             msg = msg + "\n" + founders_promo_line() + "\n" + founders_bonus_line()
         return True, msg
@@ -573,7 +658,6 @@ def build_followup_message(u: dict, stage: int) -> str:
     name = (u.get("profile", {}) or {}).get("name", "").strip()
     intro = f"hey {name} 🙂 " if name else "hey 🙂 "
 
-    # Keep it human, reference what they want, and progress toward link without robotic confirmations.
     if stage == 1:
         if u.get("link_stage", 0) >= 1:
             return intro + "quick check, were you still curious about Fanvue, or were you looking for something specific?"
@@ -610,14 +694,17 @@ def cron():
             send_message(uid, msg)
             u["followups_sent_today"] = u.get("followups_sent_today", 0) + 1
             u["last_bot_ts"] = time.time()
+            sheet_log("followup", uid, u, msg)
             sent += 1
             if sent >= 25:
                 break
 
         if eligible_for_reengage(u):
-            send_message(uid, sanitize_reply(build_reengage_message(u)))
+            msg = sanitize_reply(build_reengage_message(u))
+            send_message(uid, msg)
             u["last_reengage_ts"] = time.time()
             u["last_bot_ts"] = time.time()
+            sheet_log("reengage", uid, u, msg)
             sent += 1
             if sent >= 25:
                 break
@@ -733,7 +820,6 @@ def webhook():
     chat_id = msg["chat"]["id"]
     uid = msg.get("from", {}).get("id", chat_id)
 
-    # Only text for now
     text = (msg.get("text") or "").strip()
     if not text:
         return "ok"
@@ -754,11 +840,9 @@ def webhook():
 
     u = get_user(uid)
 
-    # takeover: silent for this user
     if u.get("takeover"):
         return "ok"
 
-    # rate limit
     if not allow_rate(u):
         return "ok"
 
@@ -780,6 +864,9 @@ def webhook():
     extract_profile(u, text)
     update_hesitation(u, text)
 
+    # log inbound
+    sheet_log("inbound_user", uid, u, text)
+
     # save history user turn
     u["history"].append({"role": "user", "content": text})
     u["history"] = u["history"][-HISTORY_TURNS:]
@@ -791,6 +878,8 @@ def webhook():
         wait_human(chat_id, d)
         send_message(chat_id, reply)
         u["last_bot_ts"] = time.time()
+        sheet_log("outbound_bot", uid, u, reply)
+
         u["history"].append({"role": "assistant", "content": reply})
         u["history"] = u["history"][-HISTORY_TURNS:]
         return "ok"
@@ -805,6 +894,8 @@ def webhook():
             reply = sanitize_reply(f"{pre_filler()} {reply}")
         send_message(chat_id, reply)
         u["last_bot_ts"] = time.time()
+        sheet_log("outbound_bot", uid, u, reply)
+
         u["history"].append({"role": "assistant", "content": reply})
         u["history"] = u["history"][-HISTORY_TURNS:]
         return "ok"
@@ -815,10 +906,9 @@ def webhook():
         if u["intent"] == "buyer_intent" and should_alert(u):
             mark_alert(u)
             label = u.get("profile", {}).get("name") or f"uid:{uid}"
-            notify_admin(
-                f"Hot intent ({label}) asked about Fanvue or promo. link_stage={u['link_stage']} hesitation={u.get('hesitation_score', 0)}",
-                current_uid=uid
-            )
+            alert_text = f"Hot intent ({label}) asked about Fanvue or promo. link_stage={u['link_stage']} hesitation={u.get('hesitation_score', 0)}"
+            notify_admin(alert_text, current_uid=uid)
+            sheet_log("admin_alert", uid, u, alert_text)
 
         reply = sanitize_reply(reply)
         d = human_delay(u["intent"], u["phase"], u["priority"])
@@ -827,6 +917,8 @@ def webhook():
             reply = sanitize_reply(f"{pre_filler()} {reply}")
         send_message(chat_id, reply)
         u["last_bot_ts"] = time.time()
+        sheet_log("outbound_bot", uid, u, reply)
+
         u["history"].append({"role": "assistant", "content": reply})
         u["history"] = u["history"][-HISTORY_TURNS:]
         return "ok"
@@ -840,6 +932,8 @@ def webhook():
     send_message(chat_id, reply)
 
     u["last_bot_ts"] = time.time()
+    sheet_log("outbound_bot", uid, u, reply)
+
     u["history"].append({"role": "assistant", "content": reply})
     u["history"] = u["history"][-HISTORY_TURNS:]
 
